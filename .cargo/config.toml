@@ -1,0 +1,5 @@
+[env]
+# Steamworks development defaults (Spacewar test app).
+# Override these in your shell/CI when needed.
+SteamAppId = { value = "480", force = false }
+SteamGameId = { value = "480", force = false }
