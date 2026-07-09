@@ -1,12 +1,14 @@
 use bevy::light::Skybox;
-use bevy::mesh::Mesh3d;
 use bevy::math::primitives::{Cuboid, Plane3d};
+use bevy::mesh::Mesh3d;
 use bevy::pbr::{MeshMaterial3d, StandardMaterial};
 use bevy::prelude::*;
 
 use crate::skybox::create_skybox_image;
 
 use crate::RotatingCube;
+
+const CUBE_EDGE: f32 = 1.5;
 
 pub fn setup(
     mut commands: Commands,
@@ -38,14 +40,14 @@ pub fn setup(
     ));
 
     commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(1.5, 1.5, 1.5).mesh().build())),
+        Mesh3d(meshes.add(Cuboid::new(CUBE_EDGE, CUBE_EDGE, CUBE_EDGE).mesh().build())),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color: Color::srgb(0.8, 0.3, 0.3),
             metallic: 0.2,
             perceptual_roughness: 0.6,
             ..default()
         })),
-        Transform::from_xyz(0.0, 0.75, 0.0)
+        Transform::from_xyz(0.0, CUBE_EDGE * 0.5, 0.0)
             .with_rotation(Quat::from_euler(EulerRot::XYZ, 0.4, 0.7, 0.2)),
         GlobalTransform::default(),
         RotatingCube,

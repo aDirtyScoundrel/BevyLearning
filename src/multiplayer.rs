@@ -14,6 +14,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SYNC_MAGIC: [u8; 4] = *b"CUBE";
 const SYNC_VERSION: u8 = 1;
+const PACKET_STATE: u8 = 1;
+const PACKET_JOIN: u8 = 2;
+const PACKET_LEAVE: u8 = 3;
 const SYNC_PORT: u16 = 34567;
 const SEND_INTERVAL: Duration = Duration::from_millis(50);
 const REMOTE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -39,8 +42,10 @@ pub struct NetworkSync {
     socket: UdpSocket,
     target_addr: SocketAddr,
     last_send: Instant,
+    announced_presence: bool,
     remote_states: HashMap<u64, RemoteState>,
     spawned_entities: HashMap<u64, Entity>,
+    departed_players: Vec<u64>,
 }
 
 pub fn generate_local_player_id() -> LocalPlayerId {
@@ -88,9 +93,55 @@ pub fn setup_network(mut commands: Commands) {
         socket,
         target_addr,
         last_send: Instant::now(),
+        announced_presence: false,
         remote_states: HashMap::new(),
         spawned_entities: HashMap::new(),
+        departed_players: Vec::new(),
     });
+}
+
+pub fn announce_local_presence(
+    local_player: Res<LocalPlayerId>,
+    local_cube_query: Query<&Transform, With<crate::RotatingCube>>,
+    mut network: Option<ResMut<NetworkSync>>,
+) {
+    let Some(network) = network.as_deref_mut() else {
+        return;
+    };
+
+    if network.announced_presence {
+        return;
+    }
+
+    let Ok(transform) = local_cube_query.single() else {
+        return;
+    };
+
+    let payload = encode_state_packet(PACKET_JOIN, local_player.value, transform);
+    let _ = network.socket.send_to(&payload, network.target_addr);
+    network.announced_presence = true;
+}
+
+pub fn send_local_leave(
+    exit_requested: Res<crate::ExitRequested>,
+    local_player: Res<LocalPlayerId>,
+    local_cube_query: Query<&Transform, With<crate::RotatingCube>>,
+    mut network: Option<ResMut<NetworkSync>>,
+) {
+    let Some(network) = network.as_deref_mut() else {
+        return;
+    };
+
+    if !exit_requested.0 {
+        return;
+    }
+
+    let Ok(transform) = local_cube_query.single() else {
+        return;
+    };
+
+    let payload = encode_state_packet(PACKET_LEAVE, local_player.value, transform);
+    let _ = network.socket.send_to(&payload, network.target_addr);
 }
 
 pub fn send_local_state(
@@ -110,7 +161,7 @@ pub fn send_local_state(
         return;
     };
 
-    let payload = encode_state_packet(local_player.value, transform);
+    let payload = encode_state_packet(PACKET_STATE, local_player.value, transform);
     let _ = network.socket.send_to(&payload, network.target_addr);
     network.last_send = Instant::now();
 }
@@ -127,17 +178,28 @@ pub fn receive_remote_states(
         let mut buf = [0u8; 96];
         match network.socket.recv_from(&mut buf) {
             Ok((len, _from)) => {
-                if let Some((player_id, transform)) = decode_state_packet(&buf[..len]) {
+                if let Some((packet_type, player_id, transform)) = decode_state_packet(&buf[..len]) {
                     if player_id == local_player.value {
                         continue;
                     }
-                    network.remote_states.insert(
-                        player_id,
-                        RemoteState {
-                            transform,
-                            last_seen: Instant::now(),
-                        },
-                    );
+
+                    match packet_type {
+                        PACKET_STATE | PACKET_JOIN => {
+                            if let Some(transform) = transform {
+                                network.remote_states.insert(
+                                    player_id,
+                                    RemoteState {
+                                        transform,
+                                        last_seen: Instant::now(),
+                                    },
+                                );
+                            }
+                        }
+                        PACKET_LEAVE => {
+                            network.departed_players.push(player_id);
+                        }
+                        _ => {}
+                    }
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -157,6 +219,13 @@ pub fn sync_remote_cubes(
         return;
     };
 
+    for player_id in network.departed_players.drain(..) {
+        network.remote_states.remove(&player_id);
+        if let Some(entity) = network.spawned_entities.remove(&player_id) {
+            commands.entity(entity).despawn();
+        }
+    }
+
     let now = Instant::now();
     network
         .remote_states
@@ -174,12 +243,7 @@ pub fn sync_remote_cubes(
             let entity = commands
                 .spawn((
                     Mesh3d(meshes.add(Cuboid::new(1.5, 1.5, 1.5).mesh().build())),
-                    MeshMaterial3d(materials.add(StandardMaterial {
-                        base_color: Color::srgb(0.2, 0.45, 0.9),
-                        metallic: 0.1,
-                        perceptual_roughness: 0.55,
-                        ..default()
-                    })),
+                    MeshMaterial3d(materials.add(player_material(*player_id))),
                     state.transform,
                     GlobalTransform::default(),
                     RemoteCube {
@@ -206,10 +270,33 @@ pub fn sync_remote_cubes(
     }
 }
 
-fn encode_state_packet(player_id: u64, transform: &Transform) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + 1 + 8 + (3 + 4) * 4);
+fn player_material(player_id: u64) -> StandardMaterial {
+    let color = player_color(player_id);
+    StandardMaterial {
+        base_color: color,
+        metallic: 0.1,
+        perceptual_roughness: 0.55,
+        ..default()
+    }
+}
+
+fn player_color(player_id: u64) -> Color {
+    let mut hash = player_id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    hash ^= hash >> 32;
+    hash = hash.wrapping_mul(0xD6E8_F1C1_9C47_9C9D);
+
+    let red = 0.35 + ((hash & 0xff) as f32 / 255.0) * 0.55;
+    let green = 0.35 + (((hash >> 8) & 0xff) as f32 / 255.0) * 0.55;
+    let blue = 0.35 + (((hash >> 16) & 0xff) as f32 / 255.0) * 0.55;
+
+    Color::srgb(red, green, blue)
+}
+
+fn encode_state_packet(packet_type: u8, player_id: u64, transform: &Transform) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + 1 + 1 + 8 + (3 + 4) * 4);
     out.extend_from_slice(&SYNC_MAGIC);
     out.push(SYNC_VERSION);
+    out.push(packet_type);
     out.extend_from_slice(&player_id.to_le_bytes());
 
     out.extend_from_slice(&transform.translation.x.to_le_bytes());
@@ -224,18 +311,29 @@ fn encode_state_packet(player_id: u64, transform: &Transform) -> Vec<u8> {
     out
 }
 
-fn decode_state_packet(data: &[u8]) -> Option<(u64, Transform)> {
-    const SIZE: usize = 4 + 1 + 8 + (3 + 4) * 4;
-    if data.len() != SIZE {
+fn decode_state_packet(data: &[u8]) -> Option<(u8, u64, Option<Transform>)> {
+    if data.len() < 4 + 1 + 1 + 8 {
         return None;
     }
     if data[0..4] != SYNC_MAGIC || data[4] != SYNC_VERSION {
         return None;
     }
 
-    let mut idx = 5;
+    let packet_type = data[5];
+    let mut idx = 6;
     let player_id = u64::from_le_bytes(data[idx..idx + 8].try_into().ok()?);
     idx += 8;
+
+    if packet_type == PACKET_LEAVE {
+        if data.len() != idx {
+            return None;
+        }
+        return Some((packet_type, player_id, None));
+    }
+
+    if data.len() != idx + (3 + 4) * 4 {
+        return None;
+    }
 
     let read_f32 = |slice: &[u8]| -> Option<f32> {
         Some(f32::from_le_bytes(slice.try_into().ok()?))
@@ -259,7 +357,7 @@ fn decode_state_packet(data: &[u8]) -> Option<(u64, Transform)> {
     let mut transform = Transform::from_xyz(tx, ty, tz);
     transform.rotation = Quat::from_xyzw(rx, ry, rz, rw);
 
-    Some((player_id, transform))
+    Some((packet_type, player_id, Some(transform)))
 }
 
 #[cfg(test)]
@@ -271,11 +369,24 @@ mod tests {
         let mut transform = Transform::from_xyz(1.25, 2.5, -3.0);
         transform.rotation = Quat::from_xyzw(0.1, 0.2, 0.3, 0.9);
 
-        let packet = encode_state_packet(42, &transform);
+        let packet = encode_state_packet(PACKET_STATE, 42, &transform);
         let parsed = decode_state_packet(&packet).unwrap();
 
-        assert_eq!(parsed.0, 42);
-        assert_eq!(parsed.1.translation, transform.translation);
-        assert_eq!(parsed.1.rotation, transform.rotation);
+        assert_eq!(parsed.0, PACKET_STATE);
+        assert_eq!(parsed.1, 42);
+        assert_eq!(parsed.2.unwrap().translation, transform.translation);
+        assert_eq!(parsed.2.unwrap().rotation, transform.rotation);
+    }
+
+    #[test]
+    fn test_leave_packet_roundtrip() {
+        let transform = Transform::from_xyz(0.0, 0.0, 0.0);
+
+        let packet = encode_state_packet(PACKET_LEAVE, 77, &transform);
+        let parsed = decode_state_packet(&packet).unwrap();
+
+        assert_eq!(parsed.0, PACKET_LEAVE);
+        assert_eq!(parsed.1, 77);
+        assert!(parsed.2.is_none());
     }
 }

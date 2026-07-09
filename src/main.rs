@@ -22,6 +22,9 @@ struct RotationControl {
     paused: bool,
 }
 
+#[derive(Resource, Default)]
+struct ExitRequested(bool);
+
 #[cfg(feature = "steamworks")]
 fn steam_init_guard() {
     let app_id_env = std::env::var("SteamAppId").ok();
@@ -71,6 +74,15 @@ fn style_fps_overlay_shadow(
     }
 }
 
+fn capture_app_exit(
+    mut exit_events: MessageReader<AppExit>,
+    mut exit_requested: ResMut<ExitRequested>,
+) {
+    if exit_events.read().next().is_some() {
+        exit_requested.0 = true;
+    }
+}
+
 fn main() {
     steam_init_guard();
     let local_player_id = multiplayer::generate_local_player_id();
@@ -101,6 +113,7 @@ fn main() {
             vertical_speed: 0.0,
             paused: false,
         })
+        .insert_resource(ExitRequested::default())
         .insert_resource(local_player_id)
         .add_systems(
             Startup,
@@ -108,13 +121,19 @@ fn main() {
         )
         .add_systems(
             Update,
+            (capture_app_exit, steam_mp::send_local_leave, multiplayer::send_local_leave).chain(),
+        )
+        .add_systems(
+            Update,
             (
                 controls::rotation_input,
                 controls::spin_cube,
                 steam_mp::process_callbacks,
+                steam_mp::announce_local_presence,
                 steam_mp::receive_remote_states,
                 steam_mp::sync_remote_cubes,
                 steam_mp::send_local_state,
+                multiplayer::announce_local_presence,
                 multiplayer::receive_remote_states,
                 multiplayer::sync_remote_cubes,
                 multiplayer::send_local_state,

@@ -16,6 +16,9 @@ mod imp {
 
     const STEAM_SYNC_MAGIC: [u8; 4] = *b"STMC";
     const STEAM_SYNC_VERSION: u8 = 1;
+    const PACKET_STATE: u8 = 1;
+    const PACKET_JOIN: u8 = 2;
+    const PACKET_LEAVE: u8 = 3;
     const SEND_INTERVAL: Duration = Duration::from_millis(50);
     const REMOTE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -35,8 +38,10 @@ mod imp {
         pub client: steamworks::Client,
         pub targets: Vec<steamworks::SteamId>,
         pub last_send: Instant,
+        pub announced_presence: bool,
         remote_states: HashMap<u64, RemoteState>,
         spawned_entities: HashMap<u64, Entity>,
+        departed_players: Vec<u64>,
     }
 
     pub fn setup_steam_sync(mut commands: Commands) {
@@ -75,9 +80,78 @@ mod imp {
             client,
             targets,
             last_send: Instant::now(),
+            announced_presence: false,
             remote_states: HashMap::new(),
             spawned_entities: HashMap::new(),
+            departed_players: Vec::new(),
         });
+    }
+
+    pub fn announce_local_presence(
+        local_cube_query: Query<&Transform, With<crate::RotatingCube>>,
+        mut steam: Option<ResMut<SteamSync>>,
+    ) {
+        let Some(steam) = steam.as_deref_mut() else {
+            return;
+        };
+
+        if steam.announced_presence || steam.targets.is_empty() {
+            return;
+        }
+
+        let Ok(transform) = local_cube_query.single() else {
+            return;
+        };
+
+        let local_id = steam.client.user().steam_id().raw();
+        let payload = encode_packet(PACKET_JOIN, local_id, transform);
+        let networking = steam.client.networking();
+
+        for target in &steam.targets {
+            networking.accept_p2p_session(*target);
+            let _ = networking.send_p2p_packet(
+                *target,
+                steamworks::SendType::UnreliableNoDelay,
+                &payload,
+            );
+        }
+
+        steam.announced_presence = true;
+    }
+
+    pub fn send_local_leave(
+        exit_requested: Res<crate::ExitRequested>,
+        local_cube_query: Query<&Transform, With<crate::RotatingCube>>,
+        mut steam: Option<ResMut<SteamSync>>,
+    ) {
+        let Some(steam) = steam.as_deref_mut() else {
+            return;
+        };
+
+        if !exit_requested.0 {
+            return;
+        }
+
+        if steam.targets.is_empty() {
+            return;
+        }
+
+        let Ok(local_transform) = local_cube_query.single() else {
+            return;
+        };
+
+        let local_id = steam.client.user().steam_id().raw();
+        let payload = encode_packet(PACKET_LEAVE, local_id, local_transform);
+        let networking = steam.client.networking();
+
+        for target in &steam.targets {
+            networking.accept_p2p_session(*target);
+            let _ = networking.send_p2p_packet(
+                *target,
+                steamworks::SendType::UnreliableNoDelay,
+                &payload,
+            );
+        }
     }
 
     pub fn process_callbacks() {}
@@ -98,7 +172,7 @@ mod imp {
         };
 
         let local_id = steam.client.user().steam_id().raw();
-        let payload = encode_packet(local_id, transform);
+        let payload = encode_packet(PACKET_STATE, local_id, transform);
         let networking = steam.client.networking();
 
         for target in &steam.targets {
@@ -124,17 +198,25 @@ mod imp {
         while let Some(size) = networking.is_p2p_packet_available() {
             let mut buf = vec![0u8; size];
             if let Some((_remote, packet_size)) = networking.read_p2p_packet(&mut buf) {
-                if let Some((player_id, transform)) = decode_packet(&buf[..packet_size]) {
+                if let Some((packet_type, player_id, transform)) = decode_packet(&buf[..packet_size]) {
                     if player_id == local_id {
                         continue;
                     }
-                    steam.remote_states.insert(
-                        player_id,
-                        RemoteState {
-                            transform,
-                            last_seen: Instant::now(),
-                        },
-                    );
+                    match packet_type {
+                        PACKET_STATE | PACKET_JOIN => {
+                            if let Some(transform) = transform {
+                                steam.remote_states.insert(
+                                    player_id,
+                                    RemoteState {
+                                        transform,
+                                        last_seen: Instant::now(),
+                                    },
+                                );
+                            }
+                        }
+                        PACKET_LEAVE => steam.departed_players.push(player_id),
+                        _ => {}
+                    }
                 }
             } else {
                 break;
@@ -153,6 +235,13 @@ mod imp {
             return;
         };
 
+        for player_id in steam.departed_players.drain(..) {
+            steam.remote_states.remove(&player_id);
+            if let Some(entity) = steam.spawned_entities.remove(&player_id) {
+                commands.entity(entity).despawn();
+            }
+        }
+
         let now = Instant::now();
         steam
             .remote_states
@@ -170,12 +259,7 @@ mod imp {
                 let entity = commands
                     .spawn((
                         Mesh3d(meshes.add(Cuboid::new(1.5, 1.5, 1.5).mesh().build())),
-                        MeshMaterial3d(materials.add(StandardMaterial {
-                            base_color: Color::srgb(0.2, 0.9, 0.45),
-                            metallic: 0.1,
-                            perceptual_roughness: 0.55,
-                            ..default()
-                        })),
+                        MeshMaterial3d(materials.add(player_material(*player_id))),
                         state.transform,
                         GlobalTransform::default(),
                         SteamRemoteCube {
@@ -202,10 +286,33 @@ mod imp {
         }
     }
 
-    fn encode_packet(player_id: u64, transform: &Transform) -> Vec<u8> {
-        let mut out = Vec::with_capacity(4 + 1 + 8 + (3 + 4) * 4);
+    fn player_material(player_id: u64) -> StandardMaterial {
+        let color = player_color(player_id);
+        StandardMaterial {
+            base_color: color,
+            metallic: 0.1,
+            perceptual_roughness: 0.55,
+            ..default()
+        }
+    }
+
+    fn player_color(player_id: u64) -> Color {
+        let mut hash = player_id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        hash ^= hash >> 32;
+        hash = hash.wrapping_mul(0xD6E8_F1C1_9C47_9C9D);
+
+        let red = 0.35 + ((hash & 0xff) as f32 / 255.0) * 0.55;
+        let green = 0.35 + (((hash >> 8) & 0xff) as f32 / 255.0) * 0.55;
+        let blue = 0.35 + (((hash >> 16) & 0xff) as f32 / 255.0) * 0.55;
+
+        Color::srgb(red, green, blue)
+    }
+
+    fn encode_packet(packet_type: u8, player_id: u64, transform: &Transform) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + 1 + 1 + 8 + (3 + 4) * 4);
         out.extend_from_slice(&STEAM_SYNC_MAGIC);
         out.push(STEAM_SYNC_VERSION);
+        out.push(packet_type);
         out.extend_from_slice(&player_id.to_le_bytes());
 
         out.extend_from_slice(&transform.translation.x.to_le_bytes());
@@ -220,18 +327,29 @@ mod imp {
         out
     }
 
-    fn decode_packet(data: &[u8]) -> Option<(u64, Transform)> {
-        const SIZE: usize = 4 + 1 + 8 + (3 + 4) * 4;
-        if data.len() != SIZE {
+    fn decode_packet(data: &[u8]) -> Option<(u8, u64, Option<Transform>)> {
+        if data.len() < 4 + 1 + 1 + 8 {
             return None;
         }
         if data[0..4] != STEAM_SYNC_MAGIC || data[4] != STEAM_SYNC_VERSION {
             return None;
         }
 
-        let mut idx = 5;
+        let packet_type = data[5];
+        let mut idx = 6;
         let player_id = u64::from_le_bytes(data[idx..idx + 8].try_into().ok()?);
         idx += 8;
+
+        if packet_type == PACKET_LEAVE {
+            if data.len() != idx {
+                return None;
+            }
+            return Some((packet_type, player_id, None));
+        }
+
+        if data.len() != idx + (3 + 4) * 4 {
+            return None;
+        }
 
         let read_f32 = |slice: &[u8]| -> Option<f32> {
             Some(f32::from_le_bytes(slice.try_into().ok()?))
@@ -255,7 +373,7 @@ mod imp {
         let mut transform = Transform::from_xyz(tx, ty, tz);
         transform.rotation = Quat::from_xyzw(rx, ry, rz, rw);
 
-        Some((player_id, transform))
+        Some((packet_type, player_id, Some(transform)))
     }
 }
 
@@ -265,6 +383,12 @@ mod imp {
 
     pub fn setup_steam_sync(_commands: Commands) {}
     pub fn process_callbacks() {}
+    pub fn announce_local_presence(_local_cube_query: Query<&Transform, With<crate::RotatingCube>>) {}
+    pub fn send_local_leave(
+        _exit_requested: Res<crate::ExitRequested>,
+        _local_cube_query: Query<&Transform, With<crate::RotatingCube>>,
+    ) {
+    }
     pub fn send_local_state(_local_cube_query: Query<&Transform, With<crate::RotatingCube>>) {}
     pub fn receive_remote_states() {}
     pub fn sync_remote_cubes(
