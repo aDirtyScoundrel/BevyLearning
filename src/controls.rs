@@ -1,7 +1,7 @@
 use bevy::input::{mouse::AccumulatedMouseMotion, ButtonInput};
 use bevy::prelude::*;
 
-use crate::RotationControl;
+
 
 #[derive(Resource, Debug, Default, Clone, Copy)]
 pub struct MovementState {
@@ -161,67 +161,6 @@ impl ControlBindings {
     }
 }
 
-pub fn rotation_input(
-    keyboard: Res<ButtonInput<KeyCode>>,
-    time: Res<Time>,
-    bindings: Res<ControlBindings>,
-    menu_state: Option<Res<crate::ui::EscapeMenuState>>,
-    mut rotation_control: ResMut<RotationControl>,
-) {
-    if let Some(menu_state) = menu_state && menu_state.is_open {
-        return;
-    }
-
-    if keyboard.just_pressed(bindings.toggle_pause) {
-        rotation_control.paused = !rotation_control.paused;
-    }
-
-    if keyboard.just_pressed(bindings.reset_vertical) {
-        rotation_control.vertical_speed = 0.0;
-    }
-
-    if keyboard.just_pressed(bindings.reset_speed) {
-        rotation_control.speed = 1.2;
-    }
-
-    const HORIZONTAL_ACCEL: f32 = 3.0;
-    const MAX_HORIZONTAL_SPEED: f32 = 12.0;
-    const VERTICAL_ACCEL: f32 = 3.0;
-    const MAX_VERTICAL_SPEED: f32 = 12.0;
-    let delta = HORIZONTAL_ACCEL * time.delta_secs();
-
-    if keyboard.pressed(bindings.turn_right) {
-        rotation_control.speed = (rotation_control.speed + delta).min(MAX_HORIZONTAL_SPEED);
-    }
-    if keyboard.pressed(bindings.turn_left) {
-        rotation_control.speed = (rotation_control.speed - delta).max(-MAX_HORIZONTAL_SPEED);
-    }
-
-    let vertical_delta = VERTICAL_ACCEL * time.delta_secs();
-    if keyboard.pressed(bindings.pitch_up) {
-        rotation_control.vertical_speed =
-            (rotation_control.vertical_speed + vertical_delta).min(MAX_VERTICAL_SPEED);
-    }
-    if keyboard.pressed(bindings.pitch_down) {
-        rotation_control.vertical_speed =
-            (rotation_control.vertical_speed - vertical_delta).max(-MAX_VERTICAL_SPEED);
-    }
-}
-
-pub fn spin_cube(
-    time: Res<Time>,
-    mut query: Query<&mut Transform, With<crate::RotatingCube>>,
-    rotation_control: Res<crate::RotationControl>,
-) {
-    if rotation_control.paused {
-        return;
-    }
-    for mut transform in &mut query {
-        transform.rotate_y(time.delta_secs() * rotation_control.speed);
-        transform.rotate_x(time.delta_secs() * rotation_control.vertical_speed);
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn move_cube(
     keyboard: Res<ButtonInput<KeyCode>>,
@@ -275,7 +214,7 @@ pub fn move_cube(
 
     for mut transform in &mut query {
         if !frozen
-            && transform.translation.y <= crate::scene::CUBE_REST_Y + 0.001
+            && transform.translation.y <= crate::player::CUBE_REST_Y + 0.001
             && keyboard.just_pressed(bindings.jump)
         {
             movement_state.vertical_velocity = JUMP_VELOCITY;
@@ -289,8 +228,8 @@ pub fn move_cube(
         transform.translation.x = transform.translation.x.clamp(-PLANE_LIMIT, PLANE_LIMIT);
         transform.translation.z = transform.translation.z.clamp(-PLANE_LIMIT, PLANE_LIMIT);
 
-        if transform.translation.y <= crate::scene::CUBE_REST_Y {
-            transform.translation.y = crate::scene::CUBE_REST_Y;
+        if transform.translation.y <= crate::player::CUBE_REST_Y {
+            transform.translation.y = crate::player::CUBE_REST_Y;
             movement_state.vertical_velocity = 0.0;
         }
     }
@@ -340,5 +279,5 @@ pub fn follow_cube_camera(
         return;
     };
 
-    rig_transform.translation = cube_transform.translation + Vec3::Y * crate::scene::CUBE_REST_Y;
+    rig_transform.translation = cube_transform.translation + Vec3::Y * crate::player::CUBE_REST_Y;
 }

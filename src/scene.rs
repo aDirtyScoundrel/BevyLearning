@@ -2,7 +2,7 @@ use bevy::asset::RenderAssetUsages;
 use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::light::Skybox;
 use bevy::math::Affine2;
-use bevy::math::primitives::{Cone, Cuboid, Plane3d};
+use bevy::math::primitives::{Cone, Plane3d};
 use bevy::mesh::Mesh3d;
 use bevy::pbr::{MeshMaterial3d, StandardMaterial};
 use bevy::prelude::*;
@@ -11,30 +11,30 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use crate::controls::CameraOrbitRig;
 use crate::skybox::create_skybox_image;
 
+use crate::player::{
+    ChickenHead, HeadTurnDelayTimer, Beak,
+    CUBE_REST_Y, spawn_player_chicken,
+};
 use crate::RotatingCube;
 
-const CUBE_EDGE: f32 = 1.5;
+#[derive(Component)]
+pub struct CameraAimCone;
+
 const FLOOR_HALF_EXTENT: f32 = 12.0;
 const FLOOR_TEXTURE_SIZE: u32 = 512;
 const FLOOR_TEXTURE_REPEAT: f32 = 10.0;
 const AIM_CONE_RADIUS: f32 = 0.24;
 const AIM_CONE_HEIGHT: f32 = 1.0;
 const AIM_CONE_OFFSET_Y: f32 = 1.8;
-const CONE_PROJECTILE_SPEED: f32 = 42.0;
-const CONE_PROJECTILE_LIFETIME_SECS: f32 = 1.0;
-const CONE_PROJECTILE_SIZE: f32 = 0.14;
+const SEED_PROJECTILE_SPEED: f32 = 42.0;
+const SEED_PROJECTILE_LIFETIME_SECS: f32 = 1.0;
+const SEED_WIDTH: f32 = 0.06;
+const SEED_LENGTH: f32 = 0.12;
 const PROJECTILE_HIT_RADIUS_SQ: f32 = 1.0;
-pub const CUBE_REST_Y: f32 = CUBE_EDGE * 0.5;
-pub const DEFAULT_CUBE_COLOR: Color = Color::srgb(0.8, 0.3, 0.3);
-pub const DEFAULT_CUBE_METALLIC: f32 = 0.2;
-pub const DEFAULT_CUBE_ROUGHNESS: f32 = 0.6;
 
 const CAMERA_PIVOT_HEIGHT: f32 = 1.4;
 const CAMERA_DISTANCE: f32 = 5.5;
 const CAMERA_HEIGHT: f32 = 1.6;
-
-#[derive(Component)]
-pub struct CameraAimCone;
 
 #[derive(Component)]
 pub struct ConeProjectile {
@@ -74,27 +74,34 @@ pub fn spawn_projectile_entity(
     velocity: Vec3,
     lifetime_secs: f32,
 ) -> Entity {
+    // Seed is elongated along Z axis, rotate to point in direction of travel
+    let seed_rotation = if velocity.length_squared() > 0.0001 {
+        Quat::from_rotation_arc(Vec3::Z, velocity.normalize())
+    } else {
+        Quat::IDENTITY
+    };
+    
     commands
         .spawn((
             Mesh3d(
                 meshes.add(
                     Cuboid::new(
-                        CONE_PROJECTILE_SIZE,
-                        CONE_PROJECTILE_SIZE,
-                        CONE_PROJECTILE_SIZE,
+                        SEED_WIDTH,
+                        SEED_WIDTH,
+                        SEED_LENGTH,
                     )
                     .mesh()
                     .build(),
                 ),
             ),
             MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: Color::srgb(1.0, 0.78, 0.20),
-                emissive: LinearRgba::rgb(0.55, 0.34, 0.08),
+                base_color: Color::srgb(0.4, 0.35, 0.25),
+                emissive: LinearRgba::rgb(0.15, 0.12, 0.08),
                 metallic: 0.0,
-                perceptual_roughness: 0.25,
+                perceptual_roughness: 0.7,
                 ..default()
             })),
-            Transform::from_translation(position),
+            Transform::from_translation(position).with_rotation(seed_rotation),
             GlobalTransform::default(),
             Visibility::default(),
             ConeProjectile {
@@ -214,20 +221,7 @@ pub fn setup(
         GlobalTransform::default(),
     ));
 
-    commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(CUBE_EDGE, CUBE_EDGE, CUBE_EDGE).mesh().build())),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: DEFAULT_CUBE_COLOR,
-            metallic: DEFAULT_CUBE_METALLIC,
-            perceptual_roughness: DEFAULT_CUBE_ROUGHNESS,
-            ..default()
-        })),
-        Transform::from_xyz(0.0, CUBE_REST_Y, 0.0)
-            .with_rotation(Quat::from_euler(EulerRot::XYZ, 0.4, 0.7, 0.2)),
-        GlobalTransform::default(),
-        Visibility::default(),
-        RotatingCube,
-    ));
+    spawn_player_chicken(&mut commands, &mut meshes, &mut materials);
 
     commands.spawn((
         Mesh3d(meshes.add(Cone::new(AIM_CONE_RADIUS, AIM_CONE_HEIGHT).mesh().build())),
@@ -284,24 +278,56 @@ pub fn setup(
 }
 
 pub fn update_camera_aim_cone(
-    cube_query: Query<&Transform, (With<RotatingCube>, Without<CameraAimCone>)>,
+    mut queries: ParamSet<(
+        Query<(&mut Transform, &mut HeadTurnDelayTimer), With<RotatingCube>>,
+        Query<&mut Transform, With<CameraAimCone>>,
+        Query<&mut Transform, (With<ChickenHead>, Without<CameraAimCone>, Without<RotatingCube>)>,
+    )>,
     camera_query: Query<&GlobalTransform, (With<Camera3d>, Without<CameraAimCone>)>,
-    mut cone_query: Query<&mut Transform, With<CameraAimCone>>,
+    body_global_query: Query<&GlobalTransform, With<RotatingCube>>,
+    head_global_query: Query<&GlobalTransform, With<ChickenHead>>,
+    time: Res<Time>,
 ) {
-    let Ok(cube_transform) = cube_query.single() else {
-        return;
-    };
     let Ok(camera_transform) = camera_query.single() else {
         return;
     };
-    let Ok(mut cone_transform) = cone_query.single_mut() else {
-        return;
+
+    // Get body transform
+    let (body_translation, body_rotation, should_rotate) = {
+        let mut body_query = queries.p0();
+        let Ok((body_transform, mut timer)) = body_query.single_mut() else {
+            return;
+        };
+        
+        // Update timer - reset if angle is small, otherwise accumulate
+        let body_fwd_xz = Vec3::new(body_transform.forward().x, 0.0, body_transform.forward().z).normalize_or_zero();
+        let camera_fwd_xz = Vec3::new(-camera_transform.forward().x, 0.0, -camera_transform.forward().z).normalize_or_zero();
+        let dot = body_fwd_xz.dot(camera_fwd_xz).clamp(-1.0, 1.0);
+        let angle = dot.acos();
+        
+        const BODY_FOLLOW_THRESHOLD: f32 = 1.396; // 80 degrees in radians
+        
+        if angle > BODY_FOLLOW_THRESHOLD {
+            timer.elapsed += time.delta_secs();
+        } else {
+            timer.elapsed = 0.0;
+        }
+        
+        let should_rotate = timer.elapsed >= timer.delay_secs;
+        (body_transform.translation, body_transform.rotation, should_rotate)
     };
 
-    let anchor = cube_transform.translation + Vec3::Y * AIM_CONE_OFFSET_Y;
+    let body_global_fwd = {
+        let Ok(body_global) = body_global_query.single() else {
+            return;
+        };
+        body_global.forward()
+    };
+
+    let anchor = body_translation + Vec3::Y * AIM_CONE_OFFSET_Y;
     let camera_pos = camera_transform.translation();
     let camera_forward = camera_transform.forward();
-    let plane_y = cube_transform.translation.y;
+    let plane_y = body_translation.y;
 
     let intersect_t = if camera_forward.y.abs() > 0.0001 {
         (plane_y - camera_pos.y) / camera_forward.y
@@ -317,9 +343,81 @@ pub fn update_camera_aim_cone(
 
     let direction = look_point - anchor;
     if direction.length_squared() > 0.00001 {
-        cone_transform.rotation = Quat::from_rotation_arc(Vec3::Y, direction.normalize());
+        let normalized_direction = direction.normalize();
+        
+        // Update cone
+        {
+            let mut cone_query = queries.p1();
+            if let Ok(mut cone_transform) = cone_query.single_mut() {
+                cone_transform.rotation = Quat::from_rotation_arc(Vec3::Y, normalized_direction);
+                cone_transform.translation = anchor;
+            }
+        }
+        
+        // Make chicken body align with head direction (after delay)
+        if should_rotate {
+            let Ok(head_global) = head_global_query.single() else {
+                // If no head found, fall back to camera direction
+                let camera_fwd_xz = Vec3::new(-camera_forward.x, 0.0, -camera_forward.z).normalize_or_zero();
+                let body_fwd_xz = Vec3::new(body_global_fwd.x, 0.0, body_global_fwd.z).normalize_or_zero();
+                
+                let dot = body_fwd_xz.dot(camera_fwd_xz).clamp(-1.0, 1.0);
+                let angle = dot.acos();
+                
+                const TURN_SPEED: f32 = 3.0; // radians per second
+                
+                if angle > 0.01 {
+                    let cross = body_fwd_xz.cross(camera_fwd_xz);
+                    let rotation_direction = if cross.y > 0.0 { 1.0 } else { -1.0 };
+                    let rotation_amount = angle.min(TURN_SPEED * time.delta_secs()) * rotation_direction;
+                    let mut body_query = queries.p0();
+                    if let Ok((mut body_transform, _)) = body_query.single_mut() {
+                        body_transform.rotate_y(rotation_amount);
+                    }
+                }
+                return;
+            };
+            
+            // Rotate body toward head's direction
+            let head_fwd_xz = Vec3::new(head_global.forward().x, 0.0, head_global.forward().z).normalize_or_zero();
+            let body_fwd_xz = Vec3::new(body_global_fwd.x, 0.0, body_global_fwd.z).normalize_or_zero();
+            
+            // Calculate angle and rotation needed
+            let dot = body_fwd_xz.dot(head_fwd_xz).clamp(-1.0, 1.0);
+            let angle = dot.acos();
+            
+            const TURN_SPEED: f32 = 3.0; // radians per second
+            
+            if angle > 0.01 {
+                // Determine rotation direction
+                let cross = body_fwd_xz.cross(head_fwd_xz);
+                let rotation_direction = if cross.y > 0.0 { 1.0 } else { -1.0 };
+                
+                // Rotate body toward head direction
+                let rotation_amount = angle.min(TURN_SPEED * time.delta_secs()) * rotation_direction;
+                let mut body_query = queries.p0();
+                if let Ok((mut body_transform, _)) = body_query.single_mut() {
+                    body_transform.rotate_y(rotation_amount);
+                }
+            }
+        }
+        
+        // Update head to point in the same direction as the camera
+        {
+            let mut head_query = queries.p2();
+            if let Ok(mut head_transform) = head_query.single_mut() {
+                // Convert camera forward direction to body-local space (negated to face correctly)
+                let local_camera_fwd = body_rotation.inverse() * (-camera_forward.as_vec3());
+                // Only use horizontal component (parallel to floor) - ignore vertical look
+                let local_camera_fwd_horizontal = Vec3::new(local_camera_fwd.x, 0.0, local_camera_fwd.z).normalize_or_zero();
+                if local_camera_fwd_horizontal.length() > 0.0 {
+                    // Head points in local +Z direction, smoothly rotate around Y axis only
+                    let target_rotation = Quat::from_rotation_arc(Vec3::Z, local_camera_fwd_horizontal);
+                    head_transform.rotation = head_transform.rotation.slerp(target_rotation, 0.1);
+                }
+            }
+        }
     }
-    cone_transform.translation = anchor;
 }
 
 pub fn spawn_cone_projectile(
@@ -327,7 +425,8 @@ pub fn spawn_cone_projectile(
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     menu_state: Option<Res<crate::ui::EscapeMenuState>>,
     local_player: Res<crate::multiplayer::LocalPlayerId>,
-    cone_query: Query<&GlobalTransform, With<CameraAimCone>>,
+    beak_query: Query<&GlobalTransform, With<Beak>>,
+    head_query: Query<&GlobalTransform, With<ChickenHead>>,
     mut projectile_sequence: ResMut<ProjectileSequence>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -341,19 +440,24 @@ pub fn spawn_cone_projectile(
         return;
     }
 
-    let Ok(cone_global) = cone_query.single() else {
+    let Ok(beak_global) = beak_query.single() else {
         return;
     };
-    let cone_transform = cone_global.compute_transform();
-    let direction = cone_transform.rotation * Vec3::Y;
-    let spawn_position = cone_transform.translation + direction * (AIM_CONE_HEIGHT * 0.5 + 0.06);
+    let Ok(head_global) = head_query.single() else {
+        return;
+    };
+    
+    // Fire seed from beak position in direction head is facing
+    let beak_transform = beak_global.compute_transform();
+    let head_forward = head_global.forward();
+    let spawn_position = beak_transform.translation + head_forward * 0.15;
     let spawn_data = ProjectileSpawnData {
         projectile_id: projectile_sequence.next_id(),
         position: spawn_position,
-        velocity: direction * CONE_PROJECTILE_SPEED,
-        lifetime_secs: CONE_PROJECTILE_LIFETIME_SECS,
+        velocity: head_forward * SEED_PROJECTILE_SPEED,
+        lifetime_secs: SEED_PROJECTILE_LIFETIME_SECS,
     };
-
+    
     spawn_projectile_entity(
         &mut commands,
         &mut meshes,

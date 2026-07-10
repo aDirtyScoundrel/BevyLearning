@@ -8,7 +8,7 @@ use bevy::prelude::*;
 #[cfg(feature = "steamworks")]
 mod imp {
     use super::*;
-    use bevy::math::primitives::Cuboid;
+    use bevy::math::primitives::Sphere;
     use bevy::mesh::Mesh3d;
     use bevy::pbr::{MeshMaterial3d, StandardMaterial};
     use std::collections::{HashMap, HashSet};
@@ -377,14 +377,21 @@ mod imp {
             } else {
                 let entity = commands
                     .spawn((
-                        Mesh3d(meshes.add(Cuboid::new(1.5, 1.5, 1.5).mesh().build())),
+                        Mesh3d(meshes.add(Sphere::new(crate::player::CHICKEN_BODY_RADIUS).mesh().uv(32, 18))),
                         MeshMaterial3d(materials.add(player_material(state.color))),
                         state.transform,
                         GlobalTransform::default(),
                         SteamRemoteCube {
                             player_id: *player_id,
                         },
+                        crate::player::HeadTurnDelayTimer {
+                            elapsed: 0.0,
+                            delay_secs: 0.5,
+                        },
                     ))
+                    .with_children(|chicken| {
+                        crate::player::spawn_chicken_parts(chicken, &mut *meshes, &mut *materials);
+                    })
                     .id();
                 steam.spawned_entities.insert(*player_id, entity);
             }

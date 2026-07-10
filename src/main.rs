@@ -4,6 +4,7 @@ mod scene;
 mod ui;
 mod skybox;
 mod steam_mp;
+mod player;
 
 use bevy::dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin};
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
@@ -17,12 +18,6 @@ use std::fs;
 #[derive(Component)]
 struct RotatingCube;
 
-#[derive(Resource)]
-struct RotationControl {
-    speed: f32,
-    vertical_speed: f32,
-    paused: bool,
-}
 
 #[derive(Resource, Default)]
 struct ExitRequested(bool);
@@ -90,16 +85,13 @@ fn add_player_controller_systems(app: &mut App) {
         Update,
         (
             controls::mouse_look,
-            controls::rotation_input,
             controls::move_cube,
-            controls::spin_cube,
         ),
     )
     .add_systems(
         Update,
         controls::follow_cube_camera
-            .after(controls::move_cube)
-            .after(controls::spin_cube),
+            .after(controls::move_cube),
     )
     .add_systems(
         Update,
@@ -145,11 +137,6 @@ fn main() {
                 },
                 ..default()
             },
-        })
-        .insert_resource(RotationControl {
-            speed: 1.2,
-            vertical_speed: 0.0,
-            paused: false,
         })
         .insert_resource(controls::ControlBindings::default())
         .insert_resource(controls::MovementState::default())
@@ -198,6 +185,13 @@ fn main() {
     add_player_controller_systems(&mut app);
 
     app
+        .add_systems(
+            Update,
+            (
+                player::flap_wings_on_jump,
+                player::animate_wing_flap,
+            ),
+        )
         .add_systems(
             Update,
             scene::update_camera_aim_cone.after(controls::follow_cube_camera),

@@ -8,7 +8,7 @@ use bevy::ui_widgets::{observe, slider_self_update, Slider, SliderDragState, Sli
 
 use crate::controls::{ControlAction, ControlBindings};
 use crate::RotatingCube;
-use crate::scene::{DEFAULT_CUBE_COLOR, DEFAULT_CUBE_METALLIC, DEFAULT_CUBE_ROUGHNESS};
+use crate::player::{DEFAULT_CUBE_COLOR, DEFAULT_CUBE_METALLIC, DEFAULT_CUBE_ROUGHNESS};
 
 const PANEL_WIDTH: f32 = 280.0;
 const PANEL_HEIGHT: f32 = 288.0;
