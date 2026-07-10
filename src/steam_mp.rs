@@ -249,8 +249,7 @@ mod imp {
 
         for (player_id, state) in &steam.remote_states {
             if let Some(entity) = steam.spawned_entities.get(player_id).copied() {
-                if let Ok((_entity, mut transform, remote)) = cube_query.get_mut(entity) {
-                    let _ = remote.player_id;
+                if let Ok((_entity, mut transform, _remote)) = cube_query.get_mut(entity) {
                     *transform = state.transform;
                 } else {
                     steam.spawned_entities.remove(player_id);
@@ -341,9 +340,6 @@ mod imp {
         idx += 8;
 
         if packet_type == PACKET_LEAVE {
-            if data.len() != idx {
-                return None;
-            }
             return Some((packet_type, player_id, None));
         }
 

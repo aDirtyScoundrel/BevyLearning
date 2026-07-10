@@ -83,14 +83,14 @@ impl HuffmanCodec {
         let freq_table = Self::get_freq_table();
 
         // Initialize leaves with frequencies
-        for i in 0..256 {
+        for (i, &freq) in freq_table.iter().enumerate() {
             self.leaves[i].symbol = i as u8;
             let mut boost = PROB_BOOST;
             // Boost alphanumeric characters
             if Self::is_alnum(i as u8) {
                 boost += PROB_BOOST;
             }
-            self.leaves[i].pop = freq_table[i] + boost;
+            self.leaves[i].pop = freq + boost;
         }
 
         // Build nodes list, starting with root placeholder
@@ -116,8 +116,8 @@ impl HuffmanCodec {
             let mut idx1 = -1i32;
             let mut idx2 = -1i32;
 
-            for i in 0..curr_wraps {
-                let pop = wraps[i].get_pop(&self.nodes, &self.leaves);
+            for (i, wrap) in wraps[..curr_wraps].iter().enumerate() {
+                let pop = wrap.get_pop(&self.nodes, &self.leaves);
                 if pop < min1 {
                     min2 = min1;
                     idx2 = idx1;
@@ -194,7 +194,7 @@ impl HuffmanCodec {
 
     /// Returns whether a byte is alphanumeric
     fn is_alnum(b: u8) -> bool {
-        (b >= b'0' && b <= b'9') || (b >= b'A' && b <= b'Z') || (b >= b'a' && b <= b'z')
+        b.is_ascii_alphanumeric()
     }
 
     /// Returns the original Tribes character frequency table

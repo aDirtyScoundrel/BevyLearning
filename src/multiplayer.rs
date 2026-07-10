@@ -325,9 +325,6 @@ fn decode_state_packet(data: &[u8]) -> Option<(u8, u64, Option<Transform>)> {
     idx += 8;
 
     if packet_type == PACKET_LEAVE {
-        if data.len() != idx {
-            return None;
-        }
         return Some((packet_type, player_id, None));
     }
 

@@ -29,7 +29,7 @@ impl<'a> BitStreamReader<'a> {
 
     /// Returns the number of bytes read so far (rounded up)
     pub fn byte_position(&self) -> usize {
-        (self.bit_offset + 7) / 8
+        self.bit_offset.div_ceil(8)
     }
 
     /// Returns the number of bits remaining
@@ -39,7 +39,7 @@ impl<'a> BitStreamReader<'a> {
 
     /// Returns the number of bytes remaining (from current bit position)
     pub fn bytes_remaining(&self) -> usize {
-        (self.bits_remaining() + 7) / 8
+        self.bits_remaining().div_ceil(8)
     }
 
     /// Reads up to 32 bits from the stream (LSB-first)
@@ -177,7 +177,7 @@ impl BitStreamWriter {
 
     /// Returns the number of bytes written so far (rounded up)
     pub fn byte_position(&self) -> usize {
-        (self.bit_offset + 7) / 8
+        self.bit_offset.div_ceil(8)
     }
 
     /// Writes up to 32 bits to the stream (LSB-first)
