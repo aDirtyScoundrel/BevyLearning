@@ -19,8 +19,10 @@ mod imp {
     const PACKET_STATE: u8 = 1;
     const PACKET_JOIN: u8 = 2;
     const PACKET_LEAVE: u8 = 3;
+    const PACKET_FREEZE: u8 = 4;
     const SEND_INTERVAL: Duration = Duration::from_millis(50);
     const REMOTE_TIMEOUT: Duration = Duration::from_secs(5);
+    const FREEZE_DURATION_SECS: f32 = 2.0;
 
     #[derive(Component, Debug, Clone, Copy)]
     pub struct SteamRemoteCube {
@@ -30,6 +32,7 @@ mod imp {
     #[derive(Debug, Clone)]
     struct RemoteState {
         transform: Transform,
+        color: Color,
         last_seen: Instant,
     }
 
@@ -42,6 +45,7 @@ mod imp {
         remote_states: HashMap<u64, RemoteState>,
         spawned_entities: HashMap<u64, Entity>,
         departed_players: Vec<u64>,
+        pending_freezes: Vec<u64>,
     }
 
     pub fn setup_steam_sync(mut commands: Commands) {
@@ -84,11 +88,50 @@ mod imp {
             remote_states: HashMap::new(),
             spawned_entities: HashMap::new(),
             departed_players: Vec::new(),
+            pending_freezes: Vec::new(),
         });
+    }
+
+    pub fn send_freeze_target(steam: &mut SteamSync, sender_id: u64, target_id: u64) {
+        if steam.targets.is_empty() {
+            return;
+        }
+
+        let payload = encode_freeze_packet(sender_id, target_id);
+        let networking = steam.client.networking();
+
+        for target in &steam.targets {
+            networking.accept_p2p_session(*target);
+            let _ = networking.send_p2p_packet(
+                *target,
+                steamworks::SendType::UnreliableNoDelay,
+                &payload,
+            );
+        }
+    }
+
+    pub fn apply_local_freeze(
+        local_player: Res<crate::multiplayer::LocalPlayerId>,
+        mut freeze: ResMut<crate::controls::MovementFreeze>,
+        mut steam: Option<ResMut<SteamSync>>,
+    ) {
+        let Some(steam) = steam.as_deref_mut() else {
+            return;
+        };
+
+        let should_freeze = steam
+            .pending_freezes
+            .drain(..)
+            .any(|target_id| target_id == local_player.value);
+
+        if should_freeze {
+            freeze.activate_for(FREEZE_DURATION_SECS);
+        }
     }
 
     pub fn announce_local_presence(
         local_cube_query: Query<&Transform, With<crate::RotatingCube>>,
+        hud: Res<crate::ui::HudState>,
         mut steam: Option<ResMut<SteamSync>>,
     ) {
         let Some(steam) = steam.as_deref_mut() else {
@@ -104,7 +147,7 @@ mod imp {
         };
 
         let local_id = steam.client.user().steam_id().raw();
-        let payload = encode_packet(PACKET_JOIN, local_id, transform);
+        let payload = encode_packet(PACKET_JOIN, local_id, transform, hud.selected_color());
         let networking = steam.client.networking();
 
         for target in &steam.targets {
@@ -141,7 +184,7 @@ mod imp {
         };
 
         let local_id = steam.client.user().steam_id().raw();
-        let payload = encode_packet(PACKET_LEAVE, local_id, local_transform);
+        let payload = encode_packet(PACKET_LEAVE, local_id, local_transform, Color::WHITE);
         let networking = steam.client.networking();
 
         for target in &steam.targets {
@@ -158,6 +201,7 @@ mod imp {
 
     pub fn send_local_state(
         local_cube_query: Query<&Transform, With<crate::RotatingCube>>,
+        hud: Res<crate::ui::HudState>,
         mut steam: Option<ResMut<SteamSync>>,
     ) {
         let Some(steam) = steam.as_deref_mut() else {
@@ -172,7 +216,7 @@ mod imp {
         };
 
         let local_id = steam.client.user().steam_id().raw();
-        let payload = encode_packet(PACKET_STATE, local_id, transform);
+        let payload = encode_packet(PACKET_STATE, local_id, transform, hud.selected_color());
         let networking = steam.client.networking();
 
         for target in &steam.targets {
@@ -198,17 +242,18 @@ mod imp {
         while let Some(size) = networking.is_p2p_packet_available() {
             let mut buf = vec![0u8; size];
             if let Some((_remote, packet_size)) = networking.read_p2p_packet(&mut buf) {
-                if let Some((packet_type, player_id, transform)) = decode_packet(&buf[..packet_size]) {
+                if let Some((packet_type, player_id, transform, color)) = decode_packet(&buf[..packet_size]) {
                     if player_id == local_id {
                         continue;
                     }
                     match packet_type {
                         PACKET_STATE | PACKET_JOIN => {
-                            if let Some(transform) = transform {
+                            if let (Some(transform), Some(color)) = (transform, color) {
                                 steam.remote_states.insert(
                                     player_id,
                                     RemoteState {
                                         transform,
+                                        color,
                                         last_seen: Instant::now(),
                                     },
                                 );
@@ -217,6 +262,8 @@ mod imp {
                         PACKET_LEAVE => steam.departed_players.push(player_id),
                         _ => {}
                     }
+                } else if let Some((_sender_id, target_id)) = decode_freeze_packet(&buf[..packet_size]) {
+                    steam.pending_freezes.push(target_id);
                 }
             } else {
                 break;
@@ -228,7 +275,7 @@ mod imp {
         mut commands: Commands,
         mut meshes: ResMut<Assets<Mesh>>,
         mut materials: ResMut<Assets<StandardMaterial>>,
-        mut cube_query: Query<(Entity, &mut Transform, &SteamRemoteCube)>,
+        mut cube_query: Query<(Entity, &mut Transform, &SteamRemoteCube, &MeshMaterial3d<StandardMaterial>)>,
         mut steam: Option<ResMut<SteamSync>>,
     ) {
         let Some(steam) = steam.as_deref_mut() else {
@@ -249,8 +296,13 @@ mod imp {
 
         for (player_id, state) in &steam.remote_states {
             if let Some(entity) = steam.spawned_entities.get(player_id).copied() {
-                if let Ok((_entity, mut transform, _remote)) = cube_query.get_mut(entity) {
+                if let Ok((_entity, mut transform, remote, material_handle)) = cube_query.get_mut(entity) {
+                    let _ = remote.player_id;
                     *transform = state.transform;
+
+                    if let Some(mut material) = materials.get_mut(&material_handle.0) {
+                        material.base_color = state.color;
+                    }
                 } else {
                     steam.spawned_entities.remove(player_id);
                 }
@@ -258,7 +310,7 @@ mod imp {
                 let entity = commands
                     .spawn((
                         Mesh3d(meshes.add(Cuboid::new(1.5, 1.5, 1.5).mesh().build())),
-                        MeshMaterial3d(materials.add(player_material(*player_id))),
+                        MeshMaterial3d(materials.add(player_material(state.color))),
                         state.transform,
                         GlobalTransform::default(),
                         SteamRemoteCube {
@@ -285,8 +337,7 @@ mod imp {
         }
     }
 
-    fn player_material(player_id: u64) -> StandardMaterial {
-        let color = player_color(player_id);
+    fn player_material(color: Color) -> StandardMaterial {
         StandardMaterial {
             base_color: color,
             metallic: 0.1,
@@ -295,20 +346,8 @@ mod imp {
         }
     }
 
-    fn player_color(player_id: u64) -> Color {
-        let mut hash = player_id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        hash ^= hash >> 32;
-        hash = hash.wrapping_mul(0xD6E8_F1C1_9C47_9C9D);
-
-        let red = 0.35 + ((hash & 0xff) as f32 / 255.0) * 0.55;
-        let green = 0.35 + (((hash >> 8) & 0xff) as f32 / 255.0) * 0.55;
-        let blue = 0.35 + (((hash >> 16) & 0xff) as f32 / 255.0) * 0.55;
-
-        Color::srgb(red, green, blue)
-    }
-
-    fn encode_packet(packet_type: u8, player_id: u64, transform: &Transform) -> Vec<u8> {
-        let mut out = Vec::with_capacity(4 + 1 + 1 + 8 + (3 + 4) * 4);
+    fn encode_packet(packet_type: u8, player_id: u64, transform: &Transform, color: Color) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + 1 + 1 + 8 + (3 + 4 + 3) * 4);
         out.extend_from_slice(&STEAM_SYNC_MAGIC);
         out.push(STEAM_SYNC_VERSION);
         out.push(packet_type);
@@ -323,10 +362,25 @@ mod imp {
         out.extend_from_slice(&transform.rotation.z.to_le_bytes());
         out.extend_from_slice(&transform.rotation.w.to_le_bytes());
 
+        let srgba = color.to_srgba();
+        out.extend_from_slice(&srgba.red.to_le_bytes());
+        out.extend_from_slice(&srgba.green.to_le_bytes());
+        out.extend_from_slice(&srgba.blue.to_le_bytes());
+
         out
     }
 
-    fn decode_packet(data: &[u8]) -> Option<(u8, u64, Option<Transform>)> {
+    fn encode_freeze_packet(sender_id: u64, target_id: u64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + 1 + 1 + 8 + 8);
+        out.extend_from_slice(&STEAM_SYNC_MAGIC);
+        out.push(STEAM_SYNC_VERSION);
+        out.push(PACKET_FREEZE);
+        out.extend_from_slice(&sender_id.to_le_bytes());
+        out.extend_from_slice(&target_id.to_le_bytes());
+        out
+    }
+
+    fn decode_packet(data: &[u8]) -> Option<(u8, u64, Option<Transform>, Option<Color>)> {
         if data.len() < 4 + 1 + 1 + 8 {
             return None;
         }
@@ -340,10 +394,13 @@ mod imp {
         idx += 8;
 
         if packet_type == PACKET_LEAVE {
-            return Some((packet_type, player_id, None));
+            if data.len() != idx {
+                return None;
+            }
+            return Some((packet_type, player_id, None, None));
         }
 
-        if data.len() != idx + (3 + 4) * 4 {
+        if data.len() != idx + (3 + 4 + 3) * 4 {
             return None;
         }
 
@@ -365,11 +422,31 @@ mod imp {
         let rz = read_f32(&data[idx..idx + 4])?;
         idx += 4;
         let rw = read_f32(&data[idx..idx + 4])?;
+        idx += 4;
+
+        let red = read_f32(&data[idx..idx + 4])?;
+        idx += 4;
+        let green = read_f32(&data[idx..idx + 4])?;
+        idx += 4;
+        let blue = read_f32(&data[idx..idx + 4])?;
 
         let mut transform = Transform::from_xyz(tx, ty, tz);
         transform.rotation = Quat::from_xyzw(rx, ry, rz, rw);
 
-        Some((packet_type, player_id, Some(transform)))
+        Some((packet_type, player_id, Some(transform), Some(Color::srgb(red, green, blue))))
+    }
+
+    fn decode_freeze_packet(data: &[u8]) -> Option<(u64, u64)> {
+        if data.len() != 4 + 1 + 1 + 8 + 8 {
+            return None;
+        }
+        if data[0..4] != STEAM_SYNC_MAGIC || data[4] != STEAM_SYNC_VERSION || data[5] != PACKET_FREEZE {
+            return None;
+        }
+
+        let sender_id = u64::from_le_bytes(data[6..14].try_into().ok()?);
+        let target_id = u64::from_le_bytes(data[14..22].try_into().ok()?);
+        Some((sender_id, target_id))
     }
 }
 
@@ -377,8 +454,22 @@ mod imp {
 mod imp {
     use super::*;
 
+    #[derive(Component, Debug, Clone, Copy)]
+    pub struct SteamRemoteCube {
+        pub player_id: u64,
+    }
+
+    #[derive(Resource)]
+    pub struct SteamSync;
+
     pub fn setup_steam_sync(_commands: Commands) {}
     pub fn process_callbacks() {}
+    pub fn send_freeze_target(_steam: &mut SteamSync, _sender_id: u64, _target_id: u64) {}
+    pub fn apply_local_freeze(
+        _local_player: Res<crate::multiplayer::LocalPlayerId>,
+        _freeze: ResMut<crate::controls::MovementFreeze>,
+    ) {
+    }
     pub fn announce_local_presence(_local_cube_query: Query<&Transform, With<crate::RotatingCube>>) {}
     pub fn send_local_leave(
         _exit_requested: Res<crate::ExitRequested>,

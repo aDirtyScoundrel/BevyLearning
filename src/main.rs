@@ -1,11 +1,13 @@
 mod controls;
 mod multiplayer;
 mod scene;
+mod ui;
 mod skybox;
 mod steam_mp;
 
 use bevy::dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin};
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
+use bevy::input_focus::tab_navigation::TabNavigationPlugin;
 use bevy::prelude::*;
 use bevy::ui::widget::TextShadow;
 use bevy::window::{PresentMode, Window, WindowPlugin};
@@ -83,18 +85,54 @@ fn capture_app_exit(
     }
 }
 
+fn add_player_controller_systems(app: &mut App) {
+    app.add_systems(
+        Update,
+        (
+            controls::mouse_look,
+            controls::rotation_input,
+            controls::move_cube,
+            controls::spin_cube,
+        ),
+    )
+    .add_systems(
+        Update,
+        controls::follow_cube_camera
+            .after(controls::move_cube)
+            .after(controls::spin_cube),
+    )
+    .add_systems(
+        Update,
+        controls::tick_movement_freeze.before(controls::move_cube),
+    )
+    .add_systems(
+        Update,
+        multiplayer::apply_local_freeze
+            .after(multiplayer::receive_remote_states)
+            .before(controls::move_cube),
+    )
+    .add_systems(
+        Update,
+        steam_mp::apply_local_freeze
+            .after(steam_mp::receive_remote_states)
+            .before(controls::move_cube),
+    );
+}
+
 fn main() {
     steam_init_guard();
     let local_player_id = multiplayer::generate_local_player_id();
 
-    App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
+    let mut app = App::new();
+
+    app.add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 present_mode: PresentMode::AutoNoVsync,
                 ..default()
             }),
             ..default()
         }))
+        .add_plugins(TabNavigationPlugin)
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .add_plugins(FpsOverlayPlugin {
             config: FpsOverlayConfig {
@@ -113,11 +151,20 @@ fn main() {
             vertical_speed: 0.0,
             paused: false,
         })
+        .insert_resource(controls::ControlBindings::default())
+        .insert_resource(controls::MovementState::default())
+        .insert_resource(controls::MovementFreeze::default())
         .insert_resource(ExitRequested::default())
         .insert_resource(local_player_id)
         .add_systems(
             Startup,
-            (multiplayer::setup_network, steam_mp::setup_steam_sync, scene::setup),
+            (
+                multiplayer::setup_network,
+                steam_mp::setup_steam_sync,
+                scene::setup,
+                ui::setup_hud,
+                ui::setup_escape_menu,
+            ),
         )
         .add_systems(
             Update,
@@ -126,8 +173,12 @@ fn main() {
         .add_systems(
             Update,
             (
-                controls::rotation_input,
-                controls::spin_cube,
+                ui::update_escape_menu,
+                ui::update_hex_color_picker,
+                ui::update_material_slider_visuals,
+                ui::update_material_sliders,
+                ui::update_player_name_stub,
+                ui::update_connected_users_stub,
                 steam_mp::process_callbacks,
                 steam_mp::announce_local_presence,
                 steam_mp::receive_remote_states,
@@ -139,8 +190,25 @@ fn main() {
                 multiplayer::send_local_state,
                 style_fps_overlay_shadow,
             ),
+        );
+
+    add_player_controller_systems(&mut app);
+
+    app
+        .add_systems(
+            Update,
+            scene::update_camera_aim_cone.after(controls::follow_cube_camera),
         )
-        .run();
+        .add_systems(
+            Update,
+            (
+                scene::spawn_cone_projectile.after(scene::update_camera_aim_cone),
+                scene::update_cone_projectiles,
+                scene::resolve_projectile_collisions.after(scene::update_cone_projectiles),
+            ),
+        );
+
+    app.run();
 }
 
 
