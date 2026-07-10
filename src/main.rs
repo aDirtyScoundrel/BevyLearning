@@ -154,6 +154,7 @@ fn main() {
         .insert_resource(controls::ControlBindings::default())
         .insert_resource(controls::MovementState::default())
         .insert_resource(controls::MovementFreeze::default())
+        .insert_resource(scene::ProjectileSequence::default())
         .insert_resource(ExitRequested::default())
         .insert_resource(local_player_id)
         .add_systems(
@@ -183,10 +184,12 @@ fn main() {
                 steam_mp::announce_local_presence,
                 steam_mp::receive_remote_states,
                 steam_mp::sync_remote_cubes,
+                steam_mp::sync_remote_projectiles,
                 steam_mp::send_local_state,
                 multiplayer::announce_local_presence,
                 multiplayer::receive_remote_states,
                 multiplayer::sync_remote_cubes,
+                multiplayer::sync_remote_projectiles,
                 multiplayer::send_local_state,
                 style_fps_overlay_shadow,
             ),

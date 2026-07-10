@@ -42,6 +42,69 @@ pub struct ConeProjectile {
     lifetime: Timer,
 }
 
+#[derive(Component)]
+pub struct ReplicatedProjectileVisual;
+
+#[derive(Resource, Default)]
+pub struct ProjectileSequence {
+    next_id: u32,
+}
+
+impl ProjectileSequence {
+    pub fn next_id(&mut self) -> u32 {
+        let projectile_id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        projectile_id
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ProjectileSpawnData {
+    pub projectile_id: u32,
+    pub position: Vec3,
+    pub velocity: Vec3,
+    pub lifetime_secs: f32,
+}
+
+pub fn spawn_projectile_entity(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    position: Vec3,
+    velocity: Vec3,
+    lifetime_secs: f32,
+) -> Entity {
+    commands
+        .spawn((
+            Mesh3d(
+                meshes.add(
+                    Cuboid::new(
+                        CONE_PROJECTILE_SIZE,
+                        CONE_PROJECTILE_SIZE,
+                        CONE_PROJECTILE_SIZE,
+                    )
+                    .mesh()
+                    .build(),
+                ),
+            ),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: Color::srgb(1.0, 0.78, 0.20),
+                emissive: LinearRgba::rgb(0.55, 0.34, 0.08),
+                metallic: 0.0,
+                perceptual_roughness: 0.25,
+                ..default()
+            })),
+            Transform::from_translation(position),
+            GlobalTransform::default(),
+            Visibility::default(),
+            ConeProjectile {
+                velocity,
+                lifetime: Timer::from_seconds(lifetime_secs, TimerMode::Once),
+            },
+        ))
+        .id()
+}
+
 fn blend_color(base: Color, overlay: Color, strength: f32) -> Color {
     let base = base.to_srgba();
     let overlay = overlay.to_srgba();
@@ -263,9 +326,13 @@ pub fn spawn_cone_projectile(
     mut commands: Commands,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     menu_state: Option<Res<crate::ui::EscapeMenuState>>,
+    local_player: Res<crate::multiplayer::LocalPlayerId>,
     cone_query: Query<&GlobalTransform, With<CameraAimCone>>,
+    mut projectile_sequence: ResMut<ProjectileSequence>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut lan_network: Option<ResMut<crate::multiplayer::NetworkSync>>,
+    mut steam_sync: Option<ResMut<crate::steam_mp::SteamSync>>,
 ) {
     if let Some(menu_state) = menu_state && menu_state.is_open {
         return;
@@ -280,28 +347,29 @@ pub fn spawn_cone_projectile(
     let cone_transform = cone_global.compute_transform();
     let direction = cone_transform.rotation * Vec3::Y;
     let spawn_position = cone_transform.translation + direction * (AIM_CONE_HEIGHT * 0.5 + 0.06);
+    let spawn_data = ProjectileSpawnData {
+        projectile_id: projectile_sequence.next_id(),
+        position: spawn_position,
+        velocity: direction * CONE_PROJECTILE_SPEED,
+        lifetime_secs: CONE_PROJECTILE_LIFETIME_SECS,
+    };
 
-    commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(
-            CONE_PROJECTILE_SIZE,
-            CONE_PROJECTILE_SIZE,
-            CONE_PROJECTILE_SIZE,
-        ).mesh().build())),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(1.0, 0.78, 0.20),
-            emissive: LinearRgba::rgb(0.55, 0.34, 0.08),
-            metallic: 0.0,
-            perceptual_roughness: 0.25,
-            ..default()
-        })),
-        Transform::from_translation(spawn_position),
-        GlobalTransform::default(),
-        Visibility::default(),
-        ConeProjectile {
-            velocity: direction * CONE_PROJECTILE_SPEED,
-            lifetime: Timer::from_seconds(CONE_PROJECTILE_LIFETIME_SECS, TimerMode::Once),
-        },
-    ));
+    spawn_projectile_entity(
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+        spawn_data.position,
+        spawn_data.velocity,
+        spawn_data.lifetime_secs,
+    );
+
+    if let Some(network) = lan_network.as_deref_mut() {
+        crate::multiplayer::send_projectile_spawn(network, local_player.value, &spawn_data);
+    }
+
+    if let Some(steam) = steam_sync.as_deref_mut() {
+        crate::steam_mp::send_projectile_spawn(steam, &spawn_data);
+    }
 }
 
 pub fn update_cone_projectiles(
@@ -328,7 +396,7 @@ pub fn resolve_projectile_collisions(
     local_player: Res<crate::multiplayer::LocalPlayerId>,
     mut lan_network: Option<ResMut<crate::multiplayer::NetworkSync>>,
     mut steam_sync: Option<ResMut<crate::steam_mp::SteamSync>>,
-    projectiles: Query<(Entity, &Transform), With<ConeProjectile>>,
+    projectiles: Query<(Entity, &Transform), (With<ConeProjectile>, Without<ReplicatedProjectileVisual>)>,
     lan_remote_cubes: Query<(&Transform, &crate::multiplayer::RemoteCube)>,
     steam_remote_cubes: Query<(&Transform, &crate::steam_mp::SteamRemoteCube)>,
 ) {

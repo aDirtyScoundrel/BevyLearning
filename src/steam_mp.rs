@@ -11,7 +11,7 @@ mod imp {
     use bevy::math::primitives::Cuboid;
     use bevy::mesh::Mesh3d;
     use bevy::pbr::{MeshMaterial3d, StandardMaterial};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::time::{Duration, Instant};
 
     const STEAM_SYNC_MAGIC: [u8; 4] = *b"STMC";
@@ -20,6 +20,7 @@ mod imp {
     const PACKET_JOIN: u8 = 2;
     const PACKET_LEAVE: u8 = 3;
     const PACKET_FREEZE: u8 = 4;
+    const PACKET_PROJECTILE: u8 = 5;
     const SEND_INTERVAL: Duration = Duration::from_millis(50);
     const REMOTE_TIMEOUT: Duration = Duration::from_secs(5);
     const FREEZE_DURATION_SECS: f32 = 2.0;
@@ -36,6 +37,11 @@ mod imp {
         last_seen: Instant,
     }
 
+    #[derive(Debug, Clone, Copy)]
+    struct RemoteProjectileSpawn {
+        spawn: crate::scene::ProjectileSpawnData,
+    }
+
     #[derive(Resource)]
     pub struct SteamSync {
         pub client: steamworks::Client,
@@ -46,6 +52,8 @@ mod imp {
         spawned_entities: HashMap<u64, Entity>,
         departed_players: Vec<u64>,
         pending_freezes: Vec<u64>,
+        pending_projectiles: Vec<RemoteProjectileSpawn>,
+        seen_projectiles: HashSet<(u64, u32)>,
     }
 
     pub fn setup_steam_sync(mut commands: Commands) {
@@ -89,6 +97,8 @@ mod imp {
             spawned_entities: HashMap::new(),
             departed_players: Vec::new(),
             pending_freezes: Vec::new(),
+            pending_projectiles: Vec::new(),
+            seen_projectiles: HashSet::new(),
         });
     }
 
@@ -110,8 +120,30 @@ mod imp {
         }
     }
 
+    pub fn send_projectile_spawn(
+        steam: &mut SteamSync,
+        spawn: &crate::scene::ProjectileSpawnData,
+    ) {
+        if steam.targets.is_empty() {
+            return;
+        }
+
+        let sender_id = steam.client.user().steam_id().raw();
+        let payload = encode_projectile_packet(sender_id, spawn);
+        let networking = steam.client.networking();
+
+        for target in &steam.targets {
+            networking.accept_p2p_session(*target);
+            let _ = networking.send_p2p_packet(
+                *target,
+                steamworks::SendType::UnreliableNoDelay,
+                &payload,
+            );
+        }
+    }
+
     pub fn apply_local_freeze(
-        local_player: Res<crate::multiplayer::LocalPlayerId>,
+        _local_player: Res<crate::multiplayer::LocalPlayerId>,
         mut freeze: ResMut<crate::controls::MovementFreeze>,
         mut steam: Option<ResMut<SteamSync>>,
     ) {
@@ -119,10 +151,12 @@ mod imp {
             return;
         };
 
+        let local_steam_id = steam.client.user().steam_id().raw();
+
         let should_freeze = steam
             .pending_freezes
             .drain(..)
-            .any(|target_id| target_id == local_player.value);
+            .any(|target_id| target_id == local_steam_id);
 
         if should_freeze {
             freeze.activate_for(FREEZE_DURATION_SECS);
@@ -262,12 +296,46 @@ mod imp {
                         PACKET_LEAVE => steam.departed_players.push(player_id),
                         _ => {}
                     }
+                } else if let Some((player_id, spawn)) = decode_projectile_packet(&buf[..packet_size]) {
+                    if player_id != local_id
+                        && steam
+                            .seen_projectiles
+                            .insert((player_id, spawn.projectile_id))
+                    {
+                        steam.pending_projectiles.push(RemoteProjectileSpawn { spawn });
+                    }
                 } else if let Some((_sender_id, target_id)) = decode_freeze_packet(&buf[..packet_size]) {
                     steam.pending_freezes.push(target_id);
                 }
             } else {
                 break;
             }
+        }
+    }
+
+    pub fn sync_remote_projectiles(
+        mut commands: Commands,
+        mut meshes: ResMut<Assets<Mesh>>,
+        mut materials: ResMut<Assets<StandardMaterial>>,
+        mut steam: Option<ResMut<SteamSync>>,
+    ) {
+        let Some(steam) = steam.as_deref_mut() else {
+            return;
+        };
+
+        for remote_projectile in steam.pending_projectiles.drain(..) {
+            let entity = crate::scene::spawn_projectile_entity(
+                &mut commands,
+                &mut meshes,
+                &mut materials,
+                remote_projectile.spawn.position,
+                remote_projectile.spawn.velocity,
+                remote_projectile.spawn.lifetime_secs,
+            );
+
+            commands.entity(entity).insert((
+                crate::scene::ReplicatedProjectileVisual,
+            ));
         }
     }
 
@@ -380,6 +448,26 @@ mod imp {
         out
     }
 
+    fn encode_projectile_packet(
+        sender_id: u64,
+        spawn: &crate::scene::ProjectileSpawnData,
+    ) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + 1 + 1 + 8 + 4 + 7 * 4);
+        out.extend_from_slice(&STEAM_SYNC_MAGIC);
+        out.push(STEAM_SYNC_VERSION);
+        out.push(PACKET_PROJECTILE);
+        out.extend_from_slice(&sender_id.to_le_bytes());
+        out.extend_from_slice(&spawn.projectile_id.to_le_bytes());
+        out.extend_from_slice(&spawn.position.x.to_le_bytes());
+        out.extend_from_slice(&spawn.position.y.to_le_bytes());
+        out.extend_from_slice(&spawn.position.z.to_le_bytes());
+        out.extend_from_slice(&spawn.velocity.x.to_le_bytes());
+        out.extend_from_slice(&spawn.velocity.y.to_le_bytes());
+        out.extend_from_slice(&spawn.velocity.z.to_le_bytes());
+        out.extend_from_slice(&spawn.lifetime_secs.to_le_bytes());
+        out
+    }
+
     fn decode_packet(data: &[u8]) -> Option<(u8, u64, Option<Transform>, Option<Color>)> {
         if data.len() < 4 + 1 + 1 + 8 {
             return None;
@@ -448,6 +536,54 @@ mod imp {
         let target_id = u64::from_le_bytes(data[14..22].try_into().ok()?);
         Some((sender_id, target_id))
     }
+
+    fn decode_projectile_packet(
+        data: &[u8],
+    ) -> Option<(u64, crate::scene::ProjectileSpawnData)> {
+        if data.len() != 4 + 1 + 1 + 8 + 4 + 7 * 4 {
+            return None;
+        }
+        if data[0..4] != STEAM_SYNC_MAGIC || data[4] != STEAM_SYNC_VERSION || data[5] != PACKET_PROJECTILE {
+            return None;
+        }
+
+        let mut idx = 6;
+        let player_id = u64::from_le_bytes(data[idx..idx + 8].try_into().ok()?);
+        idx += 8;
+
+        let projectile_id = u32::from_le_bytes(data[idx..idx + 4].try_into().ok()?);
+        idx += 4;
+
+        let read_f32 = |slice: &[u8]| -> Option<f32> {
+            Some(f32::from_le_bytes(slice.try_into().ok()?))
+        };
+
+        let position = Vec3::new(
+            read_f32(&data[idx..idx + 4])?,
+            read_f32(&data[idx + 4..idx + 8])?,
+            read_f32(&data[idx + 8..idx + 12])?,
+        );
+        idx += 12;
+
+        let velocity = Vec3::new(
+            read_f32(&data[idx..idx + 4])?,
+            read_f32(&data[idx + 4..idx + 8])?,
+            read_f32(&data[idx + 8..idx + 12])?,
+        );
+        idx += 12;
+
+        let lifetime_secs = read_f32(&data[idx..idx + 4])?;
+
+        Some((
+            player_id,
+            crate::scene::ProjectileSpawnData {
+                projectile_id,
+                position,
+                velocity,
+                lifetime_secs,
+            },
+        ))
+    }
 }
 
 #[cfg(not(feature = "steamworks"))]
@@ -465,6 +601,11 @@ mod imp {
     pub fn setup_steam_sync(_commands: Commands) {}
     pub fn process_callbacks() {}
     pub fn send_freeze_target(_steam: &mut SteamSync, _sender_id: u64, _target_id: u64) {}
+    pub fn send_projectile_spawn(
+        _steam: &mut SteamSync,
+        _spawn: &crate::scene::ProjectileSpawnData,
+    ) {
+    }
     pub fn apply_local_freeze(
         _local_player: Res<crate::multiplayer::LocalPlayerId>,
         _freeze: ResMut<crate::controls::MovementFreeze>,
@@ -479,6 +620,12 @@ mod imp {
     pub fn send_local_state(_local_cube_query: Query<&Transform, With<crate::RotatingCube>>) {}
     pub fn receive_remote_states() {}
     pub fn sync_remote_cubes(
+        _commands: Commands,
+        _meshes: ResMut<Assets<Mesh>>,
+        _materials: ResMut<Assets<StandardMaterial>>,
+    ) {
+    }
+    pub fn sync_remote_projectiles(
         _commands: Commands,
         _meshes: ResMut<Assets<Mesh>>,
         _materials: ResMut<Assets<StandardMaterial>>,

@@ -7,7 +7,7 @@ use bevy::math::primitives::Cuboid;
 use bevy::mesh::Mesh3d;
 use bevy::pbr::{MeshMaterial3d, StandardMaterial};
 use bevy::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -18,6 +18,7 @@ const PACKET_STATE: u8 = 1;
 const PACKET_JOIN: u8 = 2;
 const PACKET_LEAVE: u8 = 3;
 const PACKET_FREEZE: u8 = 4;
+const PACKET_PROJECTILE: u8 = 5;
 const SYNC_PORT: u16 = 34567;
 const SEND_INTERVAL: Duration = Duration::from_millis(50);
 const REMOTE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -40,6 +41,11 @@ struct RemoteState {
     last_seen: Instant,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RemoteProjectileSpawn {
+    spawn: crate::scene::ProjectileSpawnData,
+}
+
 #[derive(Resource)]
 pub struct NetworkSync {
     socket: UdpSocket,
@@ -50,6 +56,8 @@ pub struct NetworkSync {
     spawned_entities: HashMap<u64, Entity>,
     departed_players: Vec<u64>,
     pending_freezes: Vec<u64>,
+    pending_projectiles: Vec<RemoteProjectileSpawn>,
+    seen_projectiles: HashSet<(u64, u32)>,
 }
 
 pub fn generate_local_player_id() -> LocalPlayerId {
@@ -102,11 +110,22 @@ pub fn setup_network(mut commands: Commands) {
         spawned_entities: HashMap::new(),
         departed_players: Vec::new(),
         pending_freezes: Vec::new(),
+        pending_projectiles: Vec::new(),
+        seen_projectiles: HashSet::new(),
     });
 }
 
 pub fn send_freeze_target(network: &mut NetworkSync, sender_id: u64, target_id: u64) {
     let payload = encode_freeze_packet(sender_id, target_id);
+    let _ = network.socket.send_to(&payload, network.target_addr);
+}
+
+pub fn send_projectile_spawn(
+    network: &mut NetworkSync,
+    sender_id: u64,
+    spawn: &crate::scene::ProjectileSpawnData,
+) {
+    let payload = encode_projectile_packet(sender_id, spawn);
     let _ = network.socket.send_to(&payload, network.target_addr);
 }
 
@@ -209,7 +228,17 @@ pub fn receive_remote_states(
         let mut buf = [0u8; 96];
         match network.socket.recv_from(&mut buf) {
             Ok((len, _from)) => {
-                if let Some((packet_type, player_id, transform, color)) = decode_state_packet(&buf[..len]) {
+                if let Some((_sender_id, target_id)) = decode_freeze_packet(&buf[..len]) {
+                    network.pending_freezes.push(target_id);
+                } else if let Some((player_id, spawn)) = decode_projectile_packet(&buf[..len]) {
+                    if player_id != local_player.value
+                        && network
+                            .seen_projectiles
+                            .insert((player_id, spawn.projectile_id))
+                    {
+                        network.pending_projectiles.push(RemoteProjectileSpawn { spawn });
+                    }
+                } else if let Some((packet_type, player_id, transform, color)) = decode_state_packet(&buf[..len]) {
                     if player_id == local_player.value {
                         continue;
                     }
@@ -232,13 +261,37 @@ pub fn receive_remote_states(
                         }
                         _ => {}
                     }
-                } else if let Some((_sender_id, target_id)) = decode_freeze_packet(&buf[..len]) {
-                    network.pending_freezes.push(target_id);
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(_) => break,
         }
+    }
+}
+
+pub fn sync_remote_projectiles(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut network: Option<ResMut<NetworkSync>>,
+) {
+    let Some(network) = network.as_deref_mut() else {
+        return;
+    };
+
+    for remote_projectile in network.pending_projectiles.drain(..) {
+        let entity = crate::scene::spawn_projectile_entity(
+            &mut commands,
+            &mut meshes,
+            &mut materials,
+            remote_projectile.spawn.position,
+            remote_projectile.spawn.velocity,
+            remote_projectile.spawn.lifetime_secs,
+        );
+
+        commands.entity(entity).insert((
+            crate::scene::ReplicatedProjectileVisual,
+        ));
     }
 }
 
@@ -351,6 +404,23 @@ fn encode_freeze_packet(sender_id: u64, target_id: u64) -> Vec<u8> {
     out
 }
 
+fn encode_projectile_packet(sender_id: u64, spawn: &crate::scene::ProjectileSpawnData) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + 1 + 1 + 8 + 4 + 7 * 4);
+    out.extend_from_slice(&SYNC_MAGIC);
+    out.push(SYNC_VERSION);
+    out.push(PACKET_PROJECTILE);
+    out.extend_from_slice(&sender_id.to_le_bytes());
+    out.extend_from_slice(&spawn.projectile_id.to_le_bytes());
+    out.extend_from_slice(&spawn.position.x.to_le_bytes());
+    out.extend_from_slice(&spawn.position.y.to_le_bytes());
+    out.extend_from_slice(&spawn.position.z.to_le_bytes());
+    out.extend_from_slice(&spawn.velocity.x.to_le_bytes());
+    out.extend_from_slice(&spawn.velocity.y.to_le_bytes());
+    out.extend_from_slice(&spawn.velocity.z.to_le_bytes());
+    out.extend_from_slice(&spawn.lifetime_secs.to_le_bytes());
+    out
+}
+
 fn decode_state_packet(data: &[u8]) -> Option<(u8, u64, Option<Transform>, Option<Color>)> {
     if data.len() < 4 + 1 + 1 + 8 {
         return None;
@@ -418,6 +488,54 @@ fn decode_freeze_packet(data: &[u8]) -> Option<(u64, u64)> {
     let sender_id = u64::from_le_bytes(data[6..14].try_into().ok()?);
     let target_id = u64::from_le_bytes(data[14..22].try_into().ok()?);
     Some((sender_id, target_id))
+}
+
+fn decode_projectile_packet(
+    data: &[u8],
+) -> Option<(u64, crate::scene::ProjectileSpawnData)> {
+    if data.len() != 4 + 1 + 1 + 8 + 4 + 7 * 4 {
+        return None;
+    }
+    if data[0..4] != SYNC_MAGIC || data[4] != SYNC_VERSION || data[5] != PACKET_PROJECTILE {
+        return None;
+    }
+
+    let mut idx = 6;
+    let player_id = u64::from_le_bytes(data[idx..idx + 8].try_into().ok()?);
+    idx += 8;
+
+    let projectile_id = u32::from_le_bytes(data[idx..idx + 4].try_into().ok()?);
+    idx += 4;
+
+    let read_f32 = |slice: &[u8]| -> Option<f32> {
+        Some(f32::from_le_bytes(slice.try_into().ok()?))
+    };
+
+    let position = Vec3::new(
+        read_f32(&data[idx..idx + 4])?,
+        read_f32(&data[idx + 4..idx + 8])?,
+        read_f32(&data[idx + 8..idx + 12])?,
+    );
+    idx += 12;
+
+    let velocity = Vec3::new(
+        read_f32(&data[idx..idx + 4])?,
+        read_f32(&data[idx + 4..idx + 8])?,
+        read_f32(&data[idx + 8..idx + 12])?,
+    );
+    idx += 12;
+
+    let lifetime_secs = read_f32(&data[idx..idx + 4])?;
+
+    Some((
+        player_id,
+        crate::scene::ProjectileSpawnData {
+            projectile_id,
+            position,
+            velocity,
+            lifetime_secs,
+        },
+    ))
 }
 
 #[cfg(test)]
