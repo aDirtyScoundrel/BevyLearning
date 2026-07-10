@@ -75,6 +75,26 @@ Use comma-separated Steam64 IDs for multiple peers.
 - Do not commit personal secrets/tokens
 - Replace App ID `480` with your real app ID when moving beyond test mode
 
+## Release Packaging
+
+One-command release workflow:
+
+```bash
+./scripts/release.sh --version v0.1.1
+```
+
+Include GitHub Release asset upload (requires `GITHUB_TOKEN`):
+
+```bash
+GITHUB_TOKEN=... ./scripts/release.sh --version v0.1.1 --upload-release
+```
+
+Preview actions without making changes:
+
+```bash
+./scripts/release.sh --version v0.1.1 --dry-run
+```
+
 ## Status
 
 This repository currently contains strong networking/protocol scaffolding and local/remote multiplayer experiments. It is not yet a full server-authoritative production multiplayer implementation.
