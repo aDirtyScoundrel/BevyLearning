@@ -435,6 +435,7 @@ mod imp {
             STEAM_SYNC_MAGIC,
             STEAM_SYNC_VERSION,
             packet_type,
+            PACKET_LEAVE,
             player_id,
             transform,
             color,

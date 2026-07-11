@@ -5,6 +5,7 @@
 - Updated the chicken beak to use a cone mesh and adjusted its transform for clearer visibility.
 - Added vertical centerline alignment so the beak stays inline with the head framing.
 - Increased forward offset so the beak protrudes consistently in gameplay camera views.
+- Fixed state packet leave-message encoding to match strict header-only leave decode behavior across shared/LAN/Steam paths.
 
 ## v0.1.1 - 2026-07-10
 

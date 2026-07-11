@@ -391,6 +391,7 @@ fn encode_state_packet(packet_type: u8, player_id: u64, transform: &Transform, c
         SYNC_MAGIC,
         SYNC_VERSION,
         packet_type,
+        PACKET_LEAVE,
         player_id,
         transform,
         color,
@@ -456,16 +457,20 @@ mod tests {
     #[test]
     fn test_state_packet_roundtrip() {
         let mut transform = Transform::from_xyz(1.25, 2.5, -3.0);
-        transform.rotation = Quat::from_xyzw(0.1, 0.2, 0.3, 0.9);
+        transform.rotation = Quat::from_xyzw(0.1, 0.2, 0.3, 0.9).normalize();
         let color = Color::srgb(0.25, 0.5, 0.75);
 
         let packet = encode_state_packet(PACKET_STATE, 42, &transform, color);
         let parsed = decode_state_packet(&packet).unwrap();
+        let decoded_transform = parsed.2.unwrap();
 
         assert_eq!(parsed.0, PACKET_STATE);
         assert_eq!(parsed.1, 42);
-        assert_eq!(parsed.2.unwrap().translation, transform.translation);
-        assert_eq!(parsed.2.unwrap().rotation, transform.rotation);
+        assert_eq!(decoded_transform.translation, transform.translation);
+        assert!((decoded_transform.rotation.x - transform.rotation.x).abs() < 0.00001);
+        assert!((decoded_transform.rotation.y - transform.rotation.y).abs() < 0.00001);
+        assert!((decoded_transform.rotation.z - transform.rotation.z).abs() < 0.00001);
+        assert!((decoded_transform.rotation.w - transform.rotation.w).abs() < 0.00001);
         assert_eq!(parsed.3.unwrap().to_srgba().red, color.to_srgba().red);
     }
 

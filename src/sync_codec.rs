@@ -23,6 +23,7 @@ pub fn encode_state_packet(
     magic: [u8; 4],
     version: u8,
     packet_type: u8,
+    leave_packet_type: u8,
     player_id: u64,
     transform: &Transform,
     color: Color,
@@ -32,6 +33,10 @@ pub fn encode_state_packet(
     out.push(version);
     out.push(packet_type);
     out.extend_from_slice(&player_id.to_le_bytes());
+
+    if packet_type == leave_packet_type {
+        return out;
+    }
 
     out.extend_from_slice(&transform.translation.x.to_le_bytes());
     out.extend_from_slice(&transform.translation.y.to_le_bytes());
@@ -256,7 +261,7 @@ mod tests {
         transform.rotation = Quat::from_xyzw(0.1, 0.2, 0.3, 0.9).normalize();
         let color = Color::srgb(0.25, 0.5, 0.75);
 
-        let packet = encode_state_packet(TEST_MAGIC, TEST_VERSION, 1, 42, &transform, color);
+        let packet = encode_state_packet(TEST_MAGIC, TEST_VERSION, 1, 3, 42, &transform, color);
         let parsed = decode_state_packet(TEST_MAGIC, TEST_VERSION, 3, &packet).unwrap();
         let decoded_rotation = parsed.2.unwrap().rotation;
         let expected_rotation = transform.rotation;
@@ -275,7 +280,7 @@ mod tests {
     fn test_state_packet_rejects_nonfinite_values() {
         let transform = Transform::from_xyz(0.0, 0.0, 0.0);
         let color = Color::srgb(0.1, 0.2, 0.3);
-        let mut packet = encode_state_packet(TEST_MAGIC, TEST_VERSION, 1, 7, &transform, color);
+        let mut packet = encode_state_packet(TEST_MAGIC, TEST_VERSION, 1, 3, 7, &transform, color);
 
         let nan = f32::NAN.to_le_bytes();
         let rotation_x_offset = 6 + 8 + 12;
@@ -288,7 +293,7 @@ mod tests {
     fn test_state_packet_normalizes_malformed_finite_rotation() {
         let transform = Transform::from_xyz(0.0, 0.0, 0.0);
         let color = Color::srgb(0.1, 0.2, 0.3);
-        let mut packet = encode_state_packet(TEST_MAGIC, TEST_VERSION, 1, 7, &transform, color);
+        let mut packet = encode_state_packet(TEST_MAGIC, TEST_VERSION, 1, 3, 7, &transform, color);
 
         let rotation_x_offset = 6 + 8 + 12;
         packet[rotation_x_offset..rotation_x_offset + 4].copy_from_slice(&2.0f32.to_le_bytes());
