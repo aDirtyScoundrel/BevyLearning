@@ -467,13 +467,12 @@ pub fn spawn_cone_projectile(
         spawn_data.lifetime_secs,
     );
 
-    if let Some(network) = lan_network.as_deref_mut() {
-        crate::multiplayer::send_projectile_spawn(network, local_player.value, &spawn_data);
-    }
-
-    if let Some(steam) = steam_sync.as_deref_mut() {
-        crate::steam_mp::send_projectile_spawn(steam, local_player.value, &spawn_data);
-    }
+    crate::remote_runtime::broadcast_projectile_spawn(
+        local_player.value,
+        &spawn_data,
+        lan_network.as_deref_mut(),
+        steam_sync.as_deref_mut(),
+    );
 }
 
 pub fn update_cone_projectiles(
@@ -491,10 +490,6 @@ pub fn update_cone_projectiles(
     }
 }
 
-fn projectile_hits_cube(projectile_pos: Vec3, cube_pos: Vec3) -> bool {
-    projectile_pos.distance_squared(cube_pos) <= PROJECTILE_HIT_RADIUS_SQ
-}
-
 pub fn resolve_projectile_collisions(
     mut commands: Commands,
     local_player: Res<crate::multiplayer::LocalPlayerId>,
@@ -508,23 +503,12 @@ pub fn resolve_projectile_collisions(
 
     for (projectile_entity, projectile_transform) in &projectiles {
         let projectile_pos = projectile_transform.translation;
-        let mut hit_target = None;
-
-        for (remote_transform, remote_cube) in &lan_remote_cubes {
-            if projectile_hits_cube(projectile_pos, remote_transform.translation) {
-                hit_target = Some(remote_cube.player_id);
-                break;
-            }
-        }
-
-        if hit_target.is_none() {
-            for (remote_transform, remote_cube) in &steam_remote_cubes {
-                if projectile_hits_cube(projectile_pos, remote_transform.translation) {
-                    hit_target = Some(remote_cube.player_id);
-                    break;
-                }
-            }
-        }
+        let hit_target = crate::remote_runtime::find_remote_hit_target(
+            projectile_pos,
+            PROJECTILE_HIT_RADIUS_SQ,
+            &lan_remote_cubes,
+            &steam_remote_cubes,
+        );
 
         if let Some(target_id) = hit_target {
             commands.entity(projectile_entity).despawn();
@@ -533,12 +517,11 @@ pub fn resolve_projectile_collisions(
     }
 
     for target_id in hit_targets {
-        if let Some(network) = lan_network.as_deref_mut() {
-            crate::multiplayer::send_freeze_target(network, local_player.value, target_id);
-        }
-
-        if let Some(steam) = steam_sync.as_deref_mut() {
-            crate::steam_mp::send_freeze_target(steam, local_player.value, target_id);
-        }
+        crate::remote_runtime::broadcast_freeze_target(
+            local_player.value,
+            target_id,
+            lan_network.as_deref_mut(),
+            steam_sync.as_deref_mut(),
+        );
     }
 }

@@ -306,11 +306,80 @@ mod tests {
     }
 
     #[test]
+    fn test_state_packet_leave_contract_rejects_trailing_payload() {
+        let transform = Transform::from_xyz(0.0, 0.0, 0.0);
+        let mut packet = encode_state_packet(
+            TEST_MAGIC,
+            TEST_VERSION,
+            3,
+            3,
+            99,
+            &transform,
+            Color::WHITE,
+        );
+
+        packet.extend_from_slice(&[0u8; 4]);
+        assert!(decode_state_packet(TEST_MAGIC, TEST_VERSION, 3, &packet).is_none());
+    }
+
+    #[test]
+    fn test_state_packet_clamps_color_components() {
+        let transform = Transform::from_xyz(0.0, 0.0, 0.0);
+        let mut packet = encode_state_packet(
+            TEST_MAGIC,
+            TEST_VERSION,
+            1,
+            3,
+            77,
+            &transform,
+            Color::WHITE,
+        );
+
+        let color_offset = 6 + 8 + 12 + 16;
+        packet[color_offset..color_offset + 4].copy_from_slice(&(-1.0f32).to_le_bytes());
+        packet[color_offset + 4..color_offset + 8].copy_from_slice(&(0.5f32).to_le_bytes());
+        packet[color_offset + 8..color_offset + 12].copy_from_slice(&(2.0f32).to_le_bytes());
+
+        let parsed = decode_state_packet(TEST_MAGIC, TEST_VERSION, 3, &packet).unwrap();
+        let color = parsed.3.unwrap().to_srgba();
+        assert_eq!(color.red, 0.0);
+        assert_eq!(color.green, 0.5);
+        assert_eq!(color.blue, 1.0);
+    }
+
+    #[test]
     fn test_freeze_packet_roundtrip() {
         let packet = encode_freeze_packet(TEST_MAGIC, TEST_VERSION, 4, 11, 27);
         let parsed = decode_freeze_packet(TEST_MAGIC, TEST_VERSION, 4, &packet).unwrap();
 
         assert_eq!(parsed, (11, 27));
+    }
+
+    #[test]
+    fn test_freeze_packet_contract_matrix() {
+        let packet = encode_freeze_packet(TEST_MAGIC, TEST_VERSION, 4, 11, 27);
+
+        let mut bad_magic = packet.clone();
+        bad_magic[0] = b'X';
+        let mut bad_version = packet.clone();
+        bad_version[4] = TEST_VERSION + 1;
+        let mut bad_type = packet.clone();
+        bad_type[5] = 99;
+        let short = &packet[..packet.len() - 1];
+
+        let cases: [(&[u8], &str); 4] = [
+            (&bad_magic, "magic"),
+            (&bad_version, "version"),
+            (&bad_type, "type"),
+            (short, "len"),
+        ];
+
+        for (payload, label) in cases {
+            assert!(
+                decode_freeze_packet(TEST_MAGIC, TEST_VERSION, 4, payload).is_none(),
+                "freeze decode should reject malformed {label}"
+            );
+        }
     }
 
     #[test]
@@ -332,6 +401,47 @@ mod tests {
         assert_eq!(parsed.1.position, Vec3::new(1.0, 2.0, 3.0));
         assert_eq!(parsed.1.velocity, Vec3::new(-4.0, -5.0, -6.0));
         assert_eq!(parsed.1.lifetime_secs, 1.5);
+    }
+
+    #[test]
+    fn test_projectile_packet_contract_matrix() {
+        let packet = encode_projectile_packet(
+            TEST_MAGIC,
+            TEST_VERSION,
+            5,
+            99,
+            1234,
+            Vec3::new(1.0, 2.0, 3.0),
+            Vec3::new(-4.0, -5.0, -6.0),
+            1.5,
+        );
+
+        let mut bad_magic = packet.clone();
+        bad_magic[0] = b'X';
+        let mut bad_version = packet.clone();
+        bad_version[4] = TEST_VERSION + 1;
+        let mut bad_type = packet.clone();
+        bad_type[5] = 99;
+        let short = &packet[..packet.len() - 1];
+
+        let mut non_finite = packet.clone();
+        let position_x_offset = 6 + 8 + 4;
+        non_finite[position_x_offset..position_x_offset + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+
+        let cases: [(&[u8], &str); 5] = [
+            (&bad_magic, "magic"),
+            (&bad_version, "version"),
+            (&bad_type, "type"),
+            (short, "len"),
+            (&non_finite, "non-finite"),
+        ];
+
+        for (payload, label) in cases {
+            assert!(
+                decode_projectile_packet(TEST_MAGIC, TEST_VERSION, 5, payload).is_none(),
+                "projectile decode should reject malformed {label}"
+            );
+        }
     }
 
     #[test]

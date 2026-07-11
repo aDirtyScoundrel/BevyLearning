@@ -462,6 +462,25 @@ fn decode_projectile_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
+
+    fn make_test_network() -> NetworkSync {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+
+        NetworkSync {
+            socket,
+            target_addr: SocketAddr::from(([127, 0, 0, 1], 34567)),
+            last_send: Instant::now(),
+            presence_state: PresenceState::Pending,
+            remote_states: HashMap::new(),
+            spawned_entities: HashMap::new(),
+            departed_players: HashSet::new(),
+            pending_freezes: Vec::new(),
+            pending_projectiles: Vec::new(),
+            seen_projectiles: HashMap::new(),
+        }
+    }
 
     #[test]
     fn test_state_packet_roundtrip() {
@@ -494,5 +513,71 @@ mod tests {
         assert_eq!(parsed.1, 77);
         assert!(parsed.2.is_none());
         assert!(parsed.3.is_none());
+    }
+
+    #[test]
+    fn test_ingress_lifecycle_join_state_leave() {
+        let mut network = make_test_network();
+        let local_player_id = 1;
+        let remote_player_id = 42;
+
+        let join_transform = Transform::from_xyz(1.0, 2.0, 3.0);
+        let join_packet = encode_state_packet(
+            PACKET_JOIN,
+            remote_player_id,
+            &join_transform,
+            Color::srgb(0.2, 0.3, 0.4),
+        );
+        process_incoming_packet(&mut network, local_player_id, &join_packet);
+
+        assert!(network.remote_states.contains_key(&remote_player_id));
+
+        let state_transform = Transform::from_xyz(4.0, 5.0, 6.0);
+        let state_packet = encode_state_packet(
+            PACKET_STATE,
+            remote_player_id,
+            &state_transform,
+            Color::srgb(0.8, 0.7, 0.6),
+        );
+        process_incoming_packet(&mut network, local_player_id, &state_packet);
+
+        let updated_state = network.remote_states.get(&remote_player_id).unwrap();
+        assert_eq!(updated_state.transform.translation, state_transform.translation);
+
+        let leave_packet = encode_state_packet(
+            PACKET_LEAVE,
+            remote_player_id,
+            &Transform::default(),
+            Color::WHITE,
+        );
+        process_incoming_packet(&mut network, local_player_id, &leave_packet);
+
+        assert!(network.departed_players.contains(&remote_player_id));
+    }
+
+    #[test]
+    fn test_ingress_projectile_dedup_and_freeze() {
+        let mut network = make_test_network();
+        let local_player_id = 1;
+        let remote_player_id = 9;
+
+        let spawn = crate::scene::ProjectileSpawnData {
+            projectile_id: 7,
+            position: Vec3::new(1.0, 2.0, 3.0),
+            velocity: Vec3::new(4.0, 5.0, 6.0),
+            lifetime_secs: 1.25,
+        };
+
+        let projectile_packet = encode_projectile_packet(remote_player_id, &spawn);
+        process_incoming_packet(&mut network, local_player_id, &projectile_packet);
+        process_incoming_packet(&mut network, local_player_id, &projectile_packet);
+
+        assert_eq!(network.pending_projectiles.len(), 1);
+        assert_eq!(network.pending_projectiles[0].projectile_id, spawn.projectile_id);
+
+        let freeze_packet = encode_freeze_packet(remote_player_id, local_player_id);
+        process_incoming_packet(&mut network, local_player_id, &freeze_packet);
+
+        assert!(network.pending_freezes.contains(&local_player_id));
     }
 }
