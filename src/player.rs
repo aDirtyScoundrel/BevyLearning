@@ -1,4 +1,4 @@
-use bevy::math::primitives::{Cuboid, Cylinder, Sphere};
+use bevy::math::primitives::{Cone, Cuboid, Cylinder, Sphere};
 use bevy::mesh::Mesh3d;
 use bevy::pbr::{MeshMaterial3d, StandardMaterial};
 use bevy::prelude::*;
@@ -63,14 +63,15 @@ pub fn spawn_chicken_parts(
         .with_children(|head| {
             // Beak (relative to head)
             head.spawn((
-                Mesh3d(meshes.add(Cuboid::new(0.09, 0.055, 0.14).mesh().build())),
+                Mesh3d(meshes.add(Cone::new(0.05, 0.16).mesh().build())),
                 MeshMaterial3d(materials.add(StandardMaterial {
                     base_color: CHICKEN_ORANGE,
                     metallic: 0.0,
                     perceptual_roughness: 0.5,
                     ..default()
                 })),
-                Transform::from_xyz(0.0, -0.1, -0.23),
+                Transform::from_xyz(0.0, 0.0, -0.34)
+                    .with_rotation(Quat::from_rotation_arc(Vec3::Y, -Vec3::Z)),
                 GlobalTransform::default(),
                 Visibility::default(),
                 Beak,
