@@ -5,6 +5,7 @@ use bevy::pbr::{MeshMaterial3d, StandardMaterial};
 use bevy::prelude::*;
 use bevy::text::{EditableText, EditableTextFilter, TextCursorStyle};
 use bevy::ui_widgets::{observe, slider_self_update, Slider, SliderDragState, SliderRange, SliderThumb, SliderValue, TrackClick};
+use std::fs;
 
 use crate::controls::{ControlAction, ControlBindings};
 use crate::RotatingCube;
@@ -12,6 +13,9 @@ use crate::player::{DEFAULT_CUBE_COLOR, DEFAULT_CUBE_METALLIC, DEFAULT_CUBE_ROUG
 
 const PANEL_WIDTH: f32 = 280.0;
 const PANEL_HEIGHT: f32 = 288.0;
+const ERGO_PANEL_WIDTH: f32 = 340.0;
+const ERGO_PRESET_PATH: &str = "human_ergo_preset.cfg";
+const ERGO_TOGGLE_KEY: KeyCode = KeyCode::F8;
 
 #[derive(Resource)]
 pub struct HudState {
@@ -44,6 +48,173 @@ pub struct PlayerNameStub;
 
 #[derive(Component)]
 pub struct ConnectedUsersStub;
+
+#[derive(Component)]
+pub struct SteamBrowserRoot;
+
+#[derive(Component)]
+pub struct SteamBrowserStatusText;
+
+#[derive(Component)]
+pub struct SteamBrowserRowsText;
+
+#[derive(Component)]
+pub struct ErgoPanelRoot;
+
+#[derive(Component)]
+pub struct ErgoStatusText;
+
+#[derive(Component)]
+pub struct ErgoSaveButton {
+    slot: ErgoPresetSlot,
+}
+
+#[derive(Component)]
+pub struct ErgoLoadButton {
+    slot: ErgoPresetSlot,
+}
+
+#[derive(Component, Clone, Copy)]
+pub struct ErgoSlider {
+    setting: ErgoSetting,
+}
+
+#[derive(Component, Clone, Copy)]
+pub struct ErgoValueText {
+    setting: ErgoSetting,
+}
+
+#[derive(Component)]
+pub struct ErgoSliderThumb;
+
+#[derive(Resource)]
+pub struct ErgoPanelState {
+    status: String,
+    is_visible: bool,
+}
+
+#[derive(Clone, Copy)]
+pub enum ErgoPresetSlot {
+    Arcade,
+    Grounded,
+    Floaty,
+}
+
+impl ErgoPresetSlot {
+    fn id(self) -> &'static str {
+        match self {
+            ErgoPresetSlot::Arcade => "arcade",
+            ErgoPresetSlot::Grounded => "grounded",
+            ErgoPresetSlot::Floaty => "floaty",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            ErgoPresetSlot::Arcade => "Arcade",
+            ErgoPresetSlot::Grounded => "Grounded",
+            ErgoPresetSlot::Floaty => "Floaty",
+        }
+    }
+
+    fn from_id(id: &str) -> Option<Self> {
+        match id.trim().to_ascii_lowercase().as_str() {
+            "arcade" => Some(Self::Arcade),
+            "grounded" => Some(Self::Grounded),
+            "floaty" => Some(Self::Floaty),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum ErgoSetting {
+    MoveSpeed,
+    JumpVelocity,
+    Gravity,
+    PlaneLimit,
+    CameraSensitivityX,
+    CameraSensitivityY,
+    CameraPitchLimit,
+    WingFlapDuration,
+    WingFlapAngle,
+    WalkCycleRate,
+    WalkCycleSwing,
+    WalkCycleLift,
+}
+
+impl ErgoSetting {
+    fn label(self) -> &'static str {
+        match self {
+            ErgoSetting::MoveSpeed => "Move speed",
+            ErgoSetting::JumpVelocity => "Jump velocity",
+            ErgoSetting::Gravity => "Gravity",
+            ErgoSetting::PlaneLimit => "Plane limit",
+            ErgoSetting::CameraSensitivityX => "Sensitivity X",
+            ErgoSetting::CameraSensitivityY => "Sensitivity Y",
+            ErgoSetting::CameraPitchLimit => "Pitch limit",
+            ErgoSetting::WingFlapDuration => "Flap duration",
+            ErgoSetting::WingFlapAngle => "Flap angle",
+            ErgoSetting::WalkCycleRate => "Cycle rate",
+            ErgoSetting::WalkCycleSwing => "Max swing",
+            ErgoSetting::WalkCycleLift => "Lift amount",
+        }
+    }
+
+    fn range(self) -> (f32, f32) {
+        match self {
+            ErgoSetting::MoveSpeed => (1.0, 12.0),
+            ErgoSetting::JumpVelocity => (1.0, 15.0),
+            ErgoSetting::Gravity => (1.0, 30.0),
+            ErgoSetting::PlaneLimit => (3.0, 50.0),
+            ErgoSetting::CameraSensitivityX => (0.0005, 0.02),
+            ErgoSetting::CameraSensitivityY => (0.0005, 0.02),
+            ErgoSetting::CameraPitchLimit => (0.3, 1.55),
+            ErgoSetting::WingFlapDuration => (0.05, 1.2),
+            ErgoSetting::WingFlapAngle => (0.1, 2.2),
+            ErgoSetting::WalkCycleRate => (1.0, 20.0),
+            ErgoSetting::WalkCycleSwing => (0.05, 1.8),
+            ErgoSetting::WalkCycleLift => (0.0, 0.25),
+        }
+    }
+
+    fn value(self, ergo: &crate::config::HumanErgoConfig) -> f32 {
+        match self {
+            ErgoSetting::MoveSpeed => ergo.movement.move_speed,
+            ErgoSetting::JumpVelocity => ergo.movement.jump_velocity,
+            ErgoSetting::Gravity => ergo.movement.gravity,
+            ErgoSetting::PlaneLimit => ergo.movement.plane_limit,
+            ErgoSetting::CameraSensitivityX => ergo.camera.sensitivity_x,
+            ErgoSetting::CameraSensitivityY => ergo.camera.sensitivity_y,
+            ErgoSetting::CameraPitchLimit => ergo.camera.pitch_limit,
+            ErgoSetting::WingFlapDuration => ergo.wing_flap.duration_secs,
+            ErgoSetting::WingFlapAngle => ergo.wing_flap.angle_radians,
+            ErgoSetting::WalkCycleRate => ergo.walk_cycle.cycle_rate,
+            ErgoSetting::WalkCycleSwing => ergo.walk_cycle.max_swing_radians,
+            ErgoSetting::WalkCycleLift => ergo.walk_cycle.lift_amount,
+        }
+    }
+
+    fn set_value(self, ergo: &mut crate::config::HumanErgoConfig, raw_value: f32) {
+        let (min, max) = self.range();
+        let value = raw_value.clamp(min, max);
+
+        match self {
+            ErgoSetting::MoveSpeed => ergo.movement.move_speed = value,
+            ErgoSetting::JumpVelocity => ergo.movement.jump_velocity = value,
+            ErgoSetting::Gravity => ergo.movement.gravity = value,
+            ErgoSetting::PlaneLimit => ergo.movement.plane_limit = value,
+            ErgoSetting::CameraSensitivityX => ergo.camera.sensitivity_x = value,
+            ErgoSetting::CameraSensitivityY => ergo.camera.sensitivity_y = value,
+            ErgoSetting::CameraPitchLimit => ergo.camera.pitch_limit = value,
+            ErgoSetting::WingFlapDuration => ergo.wing_flap.duration_secs = value,
+            ErgoSetting::WingFlapAngle => ergo.wing_flap.angle_radians = value,
+            ErgoSetting::WalkCycleRate => ergo.walk_cycle.cycle_rate = value,
+            ErgoSetting::WalkCycleSwing => ergo.walk_cycle.max_swing_radians = value,
+            ErgoSetting::WalkCycleLift => ergo.walk_cycle.lift_amount = value,
+        }
+    }
+}
 
 #[derive(Component, Clone, Copy)]
 pub struct MaterialSlider {
@@ -414,6 +585,174 @@ pub fn setup_escape_menu(mut commands: Commands, bindings: Res<ControlBindings>)
         });
 }
 
+pub fn setup_steam_server_browser(mut commands: Commands) {
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(20.0),
+                top: Val::Px(20.0),
+                width: Val::Px(420.0),
+                max_height: Val::Percent(40.0),
+                overflow: Overflow::scroll_y(),
+                padding: UiRect::all(Val::Px(12.0)),
+                border: UiRect::all(Val::Px(1.0)),
+                border_radius: BorderRadius::all(Val::Px(12.0)),
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(6.0),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.07, 0.1, 0.13, 0.88)),
+            BorderColor::all(Color::srgba(0.66, 0.82, 1.0, 0.24)),
+            SteamBrowserRoot,
+        ))
+        .with_children(|panel| {
+            panel.spawn((
+                Text::new("Steam Server Browser"),
+                TextFont::from_font_size(14.0),
+                TextColor(Color::WHITE),
+            ));
+            panel.spawn((
+                Text::new("F6 refresh, Up/Down select, F7 join"),
+                TextFont::from_font_size(11.0),
+                TextColor(Color::srgba(0.82, 0.88, 0.96, 0.9)),
+                SteamBrowserStatusText,
+            ));
+            panel.spawn((
+                Text::new("No servers yet."),
+                TextFont::from_font_size(11.0),
+                TextColor(Color::srgba(0.9, 0.93, 0.97, 0.95)),
+                SteamBrowserRowsText,
+            ));
+        });
+}
+
+pub fn setup_ergo_panel(mut commands: Commands, mut ergo: ResMut<crate::config::HumanErgoConfig>) {
+    let startup_slot = ErgoPresetSlot::from_id(&ergo.autoload_preset_slot)
+        .unwrap_or(ErgoPresetSlot::Grounded);
+
+    let startup_status = match load_ergo_preset(startup_slot) {
+        Ok(loaded) => {
+            *ergo = loaded;
+            format!(
+                "Auto-loaded {} preset from {}",
+                startup_slot.label(),
+                ERGO_PRESET_PATH
+            )
+        }
+        Err(_) => format!("Ready (toggle with {:?})", ERGO_TOGGLE_KEY),
+    };
+
+    commands.insert_resource(ErgoPanelState {
+        status: startup_status,
+        is_visible: true,
+    });
+
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(20.0),
+                bottom: Val::Px(20.0),
+                width: Val::Px(ERGO_PANEL_WIDTH),
+                max_height: Val::Percent(92.0),
+                overflow: Overflow::scroll_y(),
+                padding: UiRect::all(Val::Px(14.0)),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Stretch,
+                row_gap: Val::Px(8.0),
+                border: UiRect::all(Val::Px(1.0)),
+                border_radius: BorderRadius::all(Val::Px(14.0)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.08, 0.1, 0.12, 0.9)),
+            BorderColor::all(Color::srgba(0.6, 0.8, 0.96, 0.22)),
+            ErgoPanelRoot,
+            TabGroup::default(),
+        ))
+        .with_children(|panel| {
+            panel.spawn((
+                Text::new("Human Ergo Tuning"),
+                TextFont::from_font_size(16.0),
+                TextColor(Color::WHITE),
+            ));
+
+            panel.spawn((
+                Text::new("Movement"),
+                TextFont::from_font_size(12.0),
+                TextColor(Color::srgba(0.88, 0.91, 0.95, 0.9)),
+            ));
+
+            panel.spawn(ergo_slider_row(ErgoSetting::MoveSpeed, ergo.movement.move_speed));
+            panel.spawn(ergo_slider_row(ErgoSetting::JumpVelocity, ergo.movement.jump_velocity));
+            panel.spawn(ergo_slider_row(ErgoSetting::Gravity, ergo.movement.gravity));
+            panel.spawn(ergo_slider_row(ErgoSetting::PlaneLimit, ergo.movement.plane_limit));
+
+            panel.spawn((
+                Text::new("Camera"),
+                TextFont::from_font_size(12.0),
+                TextColor(Color::srgba(0.88, 0.91, 0.95, 0.9)),
+            ));
+
+            panel.spawn(ergo_slider_row(
+                ErgoSetting::CameraSensitivityX,
+                ergo.camera.sensitivity_x,
+            ));
+            panel.spawn(ergo_slider_row(
+                ErgoSetting::CameraSensitivityY,
+                ergo.camera.sensitivity_y,
+            ));
+            panel.spawn(ergo_slider_row(
+                ErgoSetting::CameraPitchLimit,
+                ergo.camera.pitch_limit,
+            ));
+
+            panel.spawn((
+                Text::new("Animation"),
+                TextFont::from_font_size(12.0),
+                TextColor(Color::srgba(0.88, 0.91, 0.95, 0.9)),
+            ));
+
+            panel.spawn(ergo_slider_row(
+                ErgoSetting::WingFlapDuration,
+                ergo.wing_flap.duration_secs,
+            ));
+            panel.spawn(ergo_slider_row(
+                ErgoSetting::WingFlapAngle,
+                ergo.wing_flap.angle_radians,
+            ));
+            panel.spawn(ergo_slider_row(
+                ErgoSetting::WalkCycleRate,
+                ergo.walk_cycle.cycle_rate,
+            ));
+            panel.spawn(ergo_slider_row(
+                ErgoSetting::WalkCycleSwing,
+                ergo.walk_cycle.max_swing_radians,
+            ));
+            panel.spawn(ergo_slider_row(
+                ErgoSetting::WalkCycleLift,
+                ergo.walk_cycle.lift_amount,
+            ));
+
+            panel.spawn((
+                Text::new("Presets"),
+                TextFont::from_font_size(12.0),
+                TextColor(Color::srgba(0.88, 0.91, 0.95, 0.9)),
+            ));
+
+            panel.spawn(preset_slot_row(ErgoPresetSlot::Arcade));
+            panel.spawn(preset_slot_row(ErgoPresetSlot::Grounded));
+            panel.spawn(preset_slot_row(ErgoPresetSlot::Floaty));
+
+            panel.spawn((
+                Text::new(""),
+                TextFont::from_font_size(11.0),
+                TextColor(Color::srgba(0.78, 0.84, 0.9, 0.9)),
+                ErgoStatusText,
+            ));
+        });
+}
+
 #[allow(clippy::type_complexity)]
 pub fn update_hex_color_picker(
     input_focus: Res<InputFocus>,
@@ -616,6 +955,124 @@ pub fn update_player_name_stub() {}
 
 pub fn update_connected_users_stub() {}
 
+pub fn update_steam_server_browser_ui(
+    browser: Option<Res<crate::steam_mp::SteamBrowserView>>,
+    mut status_text: Query<&mut Text, With<SteamBrowserStatusText>>,
+    mut rows_text: Query<&mut Text, With<SteamBrowserRowsText>>,
+) {
+    let Some(browser) = browser else {
+        return;
+    };
+
+    if let Ok(mut status) = status_text.single_mut() {
+        status.0 = if let Some(selected) = browser.selected_index {
+            format!("{} | selected: {}", browser.status, selected + 1)
+        } else {
+            browser.status.clone()
+        };
+    }
+
+    if let Ok(mut rows) = rows_text.single_mut() {
+        rows.0 = if browser.rows.is_empty() {
+            "No servers found. Press F6 to refresh.".to_string()
+        } else {
+            browser.rows.join("\n")
+        };
+    }
+}
+
+#[allow(clippy::type_complexity)]
+pub fn update_ergo_panel(
+    mut commands: Commands,
+    keyboard_input: Res<ButtonInput<KeyCode>>,
+    mut ergo: ResMut<crate::config::HumanErgoConfig>,
+    mut panel_state: ResMut<ErgoPanelState>,
+    mut panel_root: Query<&mut Node, With<ErgoPanelRoot>>,
+    changed_sliders: Query<(&SliderValue, &ErgoSlider), Changed<SliderValue>>,
+    slider_values: Query<(Entity, &SliderValue, &ErgoSlider)>,
+    mut value_texts: Query<(&mut Text, &ErgoValueText)>,
+    mut status_text: Query<&mut Text, With<ErgoStatusText>>,
+    mut buttons: Query<
+        (
+            &Interaction,
+            Option<&ErgoSaveButton>,
+            Option<&ErgoLoadButton>,
+            &mut BackgroundColor,
+            &mut BorderColor,
+        ),
+        (Changed<Interaction>, With<Button>),
+    >,
+) {
+    for (slider_value, slider) in &changed_sliders {
+        slider.setting.set_value(&mut ergo, slider_value.0);
+    }
+
+    for (entity, slider_value, slider) in &slider_values {
+        let desired = slider.setting.value(&ergo);
+        if (slider_value.0 - desired).abs() > f32::EPSILON {
+            commands.entity(entity).insert(SliderValue(desired));
+        }
+    }
+
+    for (mut text, label) in &mut value_texts {
+        text.0 = format!("{:.3}", label.setting.value(&ergo));
+    }
+
+    for (interaction, save_button, load_button, mut bg, mut border) in &mut buttons {
+        if save_button.is_none() && load_button.is_none() {
+            continue;
+        }
+
+        match *interaction {
+            Interaction::Pressed => {
+                if let Some(save_button) = save_button {
+                    panel_state.status = match save_ergo_preset(save_button.slot, &ergo) {
+                        Ok(()) => format!("Saved {} preset", save_button.slot.label()),
+                        Err(error) => format!("Save failed: {error}"),
+                    };
+                }
+
+                if let Some(load_button) = load_button {
+                    panel_state.status = match load_ergo_preset(load_button.slot) {
+                        Ok(loaded) => {
+                            *ergo = loaded;
+                            format!("Loaded {} preset", load_button.slot.label())
+                        }
+                        Err(error) => format!("Load failed: {error}"),
+                    };
+                }
+
+                *bg = BackgroundColor(Color::srgba(0.24, 0.32, 0.45, 0.98));
+                *border = BorderColor::all(Color::srgba(0.74, 0.86, 1.0, 0.95));
+            }
+            Interaction::Hovered => {
+                *bg = BackgroundColor(Color::srgba(0.18, 0.22, 0.31, 0.98));
+                *border = BorderColor::all(Color::srgba(0.76, 0.86, 0.98, 0.65));
+            }
+            Interaction::None => {
+                *bg = BackgroundColor(Color::srgba(0.14, 0.16, 0.23, 0.96));
+                *border = BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.1));
+            }
+        }
+    }
+
+    if keyboard_input.just_pressed(ERGO_TOGGLE_KEY) {
+        panel_state.is_visible = !panel_state.is_visible;
+    }
+
+    if let Ok(mut root_node) = panel_root.single_mut() {
+        root_node.display = if panel_state.is_visible {
+            Display::Flex
+        } else {
+            Display::None
+        };
+    }
+
+    if let Ok(mut status) = status_text.single_mut() {
+        status.0 = format!("{} | Toggle: {:?}", panel_state.status, ERGO_TOGGLE_KEY);
+    }
+}
+
 fn parse_hex_color(hex: &str) -> Option<Color> {
     if hex.len() != 6 {
         return None;
@@ -759,6 +1216,287 @@ pub fn update_material_slider_visuals(
             }
         }
     }
+}
+
+#[allow(clippy::type_complexity)]
+pub fn update_ergo_slider_visuals(
+    sliders: Query<
+        (Entity, &SliderValue, &SliderRange, &Hovered, &SliderDragState),
+        (
+            Or<(
+                Changed<SliderValue>,
+                Changed<Hovered>,
+                Changed<SliderDragState>,
+            )>,
+            With<ErgoSlider>,
+        ),
+    >,
+    children: Query<&Children>,
+    mut thumbs: Query<(&mut Node, &mut BackgroundColor, Has<ErgoSliderThumb>), Without<ErgoSlider>>,
+) {
+    for (slider_entity, value, range, hovered, drag_state) in &sliders {
+        let position = range.thumb_position(value.0) * 100.0;
+
+        for child in children.iter_descendants(slider_entity) {
+            if let Ok((mut thumb_node, mut thumb_bg, is_thumb)) = thumbs.get_mut(child)
+                && is_thumb
+            {
+                thumb_node.left = Val::Percent(position);
+                thumb_bg.0 = if hovered.0 || drag_state.dragging {
+                    Color::srgba(0.93, 0.99, 1.0, 1.0)
+                } else {
+                    Color::srgba(0.8, 0.9, 1.0, 1.0)
+                };
+            }
+        }
+    }
+}
+
+fn ergo_slider_row(setting: ErgoSetting, initial_value: f32) -> impl Bundle {
+    let (min, max) = setting.range();
+
+    (
+        Node {
+            width: Val::Percent(100.0),
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(5.0),
+            ..default()
+        },
+        children![
+            (
+                Node {
+                    width: Val::Percent(100.0),
+                    justify_content: JustifyContent::SpaceBetween,
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                children![
+                    (
+                        Text::new(setting.label()),
+                        TextFont::from_font_size(11.0),
+                        TextColor(Color::srgba(0.84, 0.88, 0.92, 0.88)),
+                    ),
+                    (
+                        Text::new(format!("{initial_value:.3}")),
+                        TextFont::from_font_size(11.0),
+                        TextColor(Color::WHITE),
+                        ErgoValueText { setting },
+                    )
+                ],
+            ),
+            (
+                Node {
+                    display: Display::Flex,
+                    flex_direction: FlexDirection::Column,
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Stretch,
+                    height: Val::Px(12.0),
+                    width: Val::Percent(100.0),
+                    ..default()
+                },
+                ErgoSlider { setting },
+                Hovered::default(),
+                Slider {
+                    track_click: TrackClick::Snap,
+                    ..Default::default()
+                },
+                SliderValue(initial_value),
+                SliderRange::new(min, max),
+                observe(slider_self_update),
+                children![
+                    (
+                        Node {
+                            height: Val::Px(6.0),
+                            border_radius: BorderRadius::all(Val::Px(3.0)),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgba(0.2, 0.22, 0.28, 0.96)),
+                    ),
+                    (
+                        Node {
+                            display: Display::Flex,
+                            position_type: PositionType::Absolute,
+                            left: Val::Px(0.0),
+                            right: Val::Px(12.0),
+                            top: Val::Px(0.0),
+                            bottom: Val::Px(0.0),
+                            ..default()
+                        },
+                        children![(
+                            SliderThumb,
+                            ErgoSliderThumb,
+                            Node {
+                                display: Display::Flex,
+                                width: Val::Px(12.0),
+                                height: Val::Px(12.0),
+                                position_type: PositionType::Absolute,
+                                left: Val::Percent(0.0),
+                                border_radius: BorderRadius::MAX,
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgba(0.8, 0.9, 1.0, 1.0)),
+                        )],
+                    )
+                ],
+            )
+        ],
+    )
+}
+
+fn preset_slot_row(slot: ErgoPresetSlot) -> impl Bundle {
+    (
+        Node {
+            width: Val::Percent(100.0),
+            justify_content: JustifyContent::SpaceBetween,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(8.0),
+            ..default()
+        },
+        children![
+            (
+                Text::new(slot.label()),
+                TextFont::from_font_size(11.0),
+                TextColor(Color::srgba(0.84, 0.88, 0.92, 0.88)),
+            ),
+            (
+                Node {
+                    column_gap: Val::Px(8.0),
+                    ..default()
+                },
+                children![
+                    (
+                        Button,
+                        Node {
+                            width: Val::Px(96.0),
+                            padding: UiRect::axes(Val::Px(8.0), Val::Px(6.0)),
+                            border: UiRect::all(Val::Px(1.0)),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            border_radius: BorderRadius::all(Val::Px(10.0)),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgba(0.14, 0.2, 0.16, 0.96)),
+                        BorderColor::all(Color::srgba(0.76, 0.96, 0.74, 0.34)),
+                        ErgoSaveButton { slot },
+                        children![(
+                            Text::new("Save"),
+                            TextFont::from_font_size(11.0),
+                            TextColor(Color::WHITE),
+                        )],
+                    ),
+                    (
+                        Button,
+                        Node {
+                            width: Val::Px(96.0),
+                            padding: UiRect::axes(Val::Px(8.0), Val::Px(6.0)),
+                            border: UiRect::all(Val::Px(1.0)),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            border_radius: BorderRadius::all(Val::Px(10.0)),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgba(0.15, 0.18, 0.24, 0.96)),
+                        BorderColor::all(Color::srgba(0.78, 0.84, 1.0, 0.34)),
+                        ErgoLoadButton { slot },
+                        children![(
+                            Text::new("Load"),
+                            TextFont::from_font_size(11.0),
+                            TextColor(Color::WHITE),
+                        )],
+                    )
+                ],
+            )
+        ],
+    )
+}
+
+fn save_ergo_preset(slot: ErgoPresetSlot, ergo: &crate::config::HumanErgoConfig) -> Result<(), String> {
+    let slot_key = slot.id();
+    let mut existing = fs::read_to_string(ERGO_PRESET_PATH).unwrap_or_default();
+
+    let mut lines: Vec<String> = existing
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.starts_with(&format!("{slot_key}."))
+        })
+        .map(ToString::to_string)
+        .collect();
+
+    lines.push(format!("{slot_key}.move_speed={}", ergo.movement.move_speed));
+    lines.push(format!("{slot_key}.jump_velocity={}", ergo.movement.jump_velocity));
+    lines.push(format!("{slot_key}.gravity={}", ergo.movement.gravity));
+    lines.push(format!("{slot_key}.plane_limit={}", ergo.movement.plane_limit));
+    lines.push(format!("{slot_key}.camera_sensitivity_x={}", ergo.camera.sensitivity_x));
+    lines.push(format!("{slot_key}.camera_sensitivity_y={}", ergo.camera.sensitivity_y));
+    lines.push(format!("{slot_key}.camera_pitch_limit={}", ergo.camera.pitch_limit));
+    lines.push(format!("{slot_key}.wing_flap_duration={}", ergo.wing_flap.duration_secs));
+    lines.push(format!("{slot_key}.wing_flap_angle={}", ergo.wing_flap.angle_radians));
+    lines.push(format!("{slot_key}.walk_cycle_rate={}", ergo.walk_cycle.cycle_rate));
+    lines.push(format!("{slot_key}.walk_cycle_swing={}", ergo.walk_cycle.max_swing_radians));
+    lines.push(format!("{slot_key}.walk_cycle_lift={}", ergo.walk_cycle.lift_amount));
+
+    existing = lines.join("\n");
+    fs::write(ERGO_PRESET_PATH, existing).map_err(|error| error.to_string())
+}
+
+fn load_ergo_preset(slot: ErgoPresetSlot) -> Result<crate::config::HumanErgoConfig, String> {
+    let raw = fs::read_to_string(ERGO_PRESET_PATH).map_err(|error| error.to_string())?;
+    let slot_key = slot.id();
+    let mut loaded = crate::config::HumanErgoConfig::default();
+    let mut any_loaded = false;
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let Some((key, value_raw)) = trimmed.split_once('=') else {
+            continue;
+        };
+
+        let Ok(value) = value_raw.trim().parse::<f32>() else {
+            continue;
+        };
+
+        let key = key.trim();
+        let key = if let Some((prefix, scoped_key)) = key.split_once('.') {
+            if prefix != slot_key {
+                continue;
+            }
+            scoped_key
+        } else {
+            // Backward compatibility with older single-preset files.
+            if !matches!(slot, ErgoPresetSlot::Grounded) {
+                continue;
+            }
+            key
+        };
+
+        match key {
+            "move_speed" => loaded.movement.move_speed = value,
+            "jump_velocity" => loaded.movement.jump_velocity = value,
+            "gravity" => loaded.movement.gravity = value,
+            "plane_limit" => loaded.movement.plane_limit = value,
+            "camera_sensitivity_x" => loaded.camera.sensitivity_x = value,
+            "camera_sensitivity_y" => loaded.camera.sensitivity_y = value,
+            "camera_pitch_limit" => loaded.camera.pitch_limit = value,
+            "wing_flap_duration" => loaded.wing_flap.duration_secs = value,
+            "wing_flap_angle" => loaded.wing_flap.angle_radians = value,
+            "walk_cycle_rate" => loaded.walk_cycle.cycle_rate = value,
+            "walk_cycle_swing" => loaded.walk_cycle.max_swing_radians = value,
+            "walk_cycle_lift" => loaded.walk_cycle.lift_amount = value,
+            _ => {}
+        }
+        any_loaded = true;
+    }
+
+    if !any_loaded {
+        return Err(format!("Preset '{}' not found in {}", slot.label(), ERGO_PRESET_PATH));
+    }
+
+    Ok(loaded)
 }
 
 #[allow(clippy::type_complexity)]

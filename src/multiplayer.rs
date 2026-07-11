@@ -36,10 +36,10 @@ pub struct RemoteCube {
 }
 
 #[derive(Debug, Clone)]
-struct RemoteState {
-    transform: Transform,
-    color: Color,
-    last_seen: Instant,
+pub(crate) struct RemoteState {
+    pub(crate) transform: Transform,
+    pub(crate) color: Color,
+    pub(crate) last_seen: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,12 +48,45 @@ enum PresenceState {
     Announced,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeNetRole {
+    LegacyPeer,
+    AuthServer,
+    UntrustedClient,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PlayerInputSample {
+    pub(crate) move_x: f32,
+    pub(crate) move_z: f32,
+    pub(crate) jump: bool,
+    pub(crate) color: Color,
+}
+
+impl Default for PlayerInputSample {
+    fn default() -> Self {
+        Self {
+            move_x: 0.0,
+            move_z: 0.0,
+            jump: false,
+            color: Color::srgb(0.96, 0.94, 0.88),
+        }
+    }
+}
+
 #[derive(Resource)]
 pub struct NetworkSync {
     socket: UdpSocket,
     target_addr: SocketAddr,
     last_send: Instant,
     presence_state: PresenceState,
+    role: RuntimeNetRole,
+    server_runtime: Option<learning::server::ServerNetworkManager>,
+    client_manager: Option<learning::client::ClientNetworkManager>,
+    last_server_broadcast: Instant,
+    authoritative_inputs: HashMap<u64, PlayerInputSample>,
+    authoritative_vertical_velocity: HashMap<u64, f32>,
+    pending_local_reconciliation: Option<Transform>,
     remote_states: HashMap<u64, RemoteState>,
     spawned_entities: HashMap<u64, Entity>,
     departed_players: HashSet<u64>,
@@ -144,10 +177,46 @@ pub fn setup_network(mut commands: Commands) {
         return;
     }
 
-    let target_addr = env::var("CUBE_SYNC_TARGET")
+    let role = if env::var("CUBE_AUTH_SERVER")
+        .ok()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    {
+        RuntimeNetRole::AuthServer
+    } else if env::var("CUBE_AUTH_SERVER_ADDR").is_ok() {
+        RuntimeNetRole::UntrustedClient
+    } else {
+        RuntimeNetRole::LegacyPeer
+    };
+
+    let target_addr = env::var("CUBE_AUTH_SERVER_ADDR")
         .ok()
         .and_then(|s| s.parse::<SocketAddr>().ok())
+        .or_else(|| {
+            env::var("CUBE_SYNC_TARGET")
+                .ok()
+                .and_then(|s| s.parse::<SocketAddr>().ok())
+        })
         .unwrap_or_else(|| SocketAddr::from(([255, 255, 255, 255], SYNC_PORT)));
+
+    let server_runtime = if role == RuntimeNetRole::AuthServer {
+        Some(learning::server::ServerNetworkManager::new(
+            SocketAddr::from(([0, 0, 0, 0], SYNC_PORT)),
+        ))
+    } else {
+        None
+    };
+
+    let client_manager = if role == RuntimeNetRole::UntrustedClient {
+        let mut manager = learning::client::ClientNetworkManager::with_identity(
+            target_addr,
+            generate_local_player_id().value,
+            env::var("CUBE_AUTH_SECRET").unwrap_or_else(|_| "dev-auth-secret".to_string()),
+        );
+        let _ = manager.connect();
+        Some(manager)
+    } else {
+        None
+    };
 
     println!(
         "[multiplayer] listening on {} and broadcasting to {}",
@@ -159,6 +228,13 @@ pub fn setup_network(mut commands: Commands) {
         target_addr,
         last_send: Instant::now(),
         presence_state: PresenceState::Pending,
+        role,
+        server_runtime,
+        client_manager,
+        last_server_broadcast: Instant::now(),
+        authoritative_inputs: HashMap::new(),
+        authoritative_vertical_velocity: HashMap::new(),
+        pending_local_reconciliation: None,
         remote_states: HashMap::new(),
         spawned_entities: HashMap::new(),
         departed_players: HashSet::new(),
@@ -201,6 +277,32 @@ pub fn apply_local_freeze(
     }
 }
 
+pub fn apply_local_reconciliation(
+    time: Res<Time>,
+    mut network: Option<ResMut<NetworkSync>>,
+    mut local_cube: Query<&mut Transform, With<crate::RotatingCube>>,
+) {
+    let Some(network) = network.as_deref_mut() else {
+        return;
+    };
+
+    let Some(target) = network.pending_local_reconciliation else {
+        return;
+    };
+
+    let Ok(mut transform) = local_cube.single_mut() else {
+        return;
+    };
+
+    let alpha = (time.delta_secs() * 12.0).clamp(0.0, 1.0);
+    transform.translation = transform.translation.lerp(target.translation, alpha);
+
+    if transform.translation.distance(target.translation) < 0.01 {
+        transform.translation = target.translation;
+        network.pending_local_reconciliation = None;
+    }
+}
+
 pub fn announce_local_presence(
     local_player: Res<LocalPlayerId>,
     local_cube_query: Query<&Transform, With<crate::RotatingCube>>,
@@ -215,12 +317,21 @@ pub fn announce_local_presence(
         return;
     }
 
-    let Ok(transform) = local_cube_query.single() else {
-        return;
-    };
+    match network.role {
+        RuntimeNetRole::UntrustedClient => {
+            let payload = encode_auth_hello(local_player.value);
+            send_payload(network, &payload);
+        }
+        RuntimeNetRole::LegacyPeer => {
+            let Ok(transform) = local_cube_query.single() else {
+                return;
+            };
 
-    let payload = encode_state_packet(PACKET_JOIN, local_player.value, transform, hud.selected_color());
-    send_payload(network, &payload);
+            let payload = encode_state_packet(PACKET_JOIN, local_player.value, transform, hud.selected_color());
+            send_payload(network, &payload);
+        }
+        RuntimeNetRole::AuthServer => {}
+    }
     network.presence_state = PresenceState::Announced;
 }
 
@@ -250,6 +361,8 @@ pub fn send_local_state(
     local_player: Res<LocalPlayerId>,
     local_cube_query: Query<&Transform, With<crate::RotatingCube>>,
     hud: Res<crate::ui::HudState>,
+    ergo: Res<crate::config::HumanErgoConfig>,
+    input_intent: Res<crate::controls::PlayerInputIntent>,
     mut network: Option<ResMut<NetworkSync>>,
 ) {
     let Some(network) = network.as_deref_mut() else {
@@ -260,13 +373,51 @@ pub fn send_local_state(
         return;
     }
 
-    let Ok(transform) = local_cube_query.single() else {
-        return;
-    };
+    match network.role {
+        RuntimeNetRole::LegacyPeer => {
+            let Ok(transform) = local_cube_query.single() else {
+                return;
+            };
 
-    let payload = encode_state_packet(PACKET_STATE, local_player.value, transform, hud.selected_color());
-    send_payload(network, &payload);
-    network.last_send = Instant::now();
+            let payload = encode_state_packet(PACKET_STATE, local_player.value, transform, hud.selected_color());
+            send_payload(network, &payload);
+            network.last_send = Instant::now();
+        }
+        RuntimeNetRole::UntrustedClient => {
+            let Some(manager) = network.client_manager.as_mut() else {
+                return;
+            };
+            let input_payload = encode_input_payload(
+                input_intent.move_x,
+                input_intent.move_z,
+                input_intent.jump,
+                hud.selected_color(),
+            );
+            let Ok(packet) = manager.next_input_packet(&input_payload) else {
+                return;
+            };
+
+            let payload = encode_input_packet(packet.session_token, packet.input_sequence, packet.payload);
+            send_payload(network, &payload);
+            network.last_send = Instant::now();
+        }
+        RuntimeNetRole::AuthServer => {
+            if network.last_server_broadcast.elapsed() < SEND_INTERVAL {
+                return;
+            }
+
+            crate::server_tick::step_authoritative_sim(
+                &mut network.remote_states,
+                &network.authoritative_inputs,
+                &mut network.authoritative_vertical_velocity,
+                &ergo,
+                SEND_INTERVAL.as_secs_f32(),
+            );
+            server_broadcast_snapshot(network);
+            network.last_server_broadcast = Instant::now();
+            network.last_send = Instant::now();
+        }
+    }
 }
 
 pub fn receive_remote_states(
@@ -277,10 +428,25 @@ pub fn receive_remote_states(
         return;
     };
 
+    let now = Instant::now();
+
     loop {
         let mut buf = [0u8; 96];
         match network.socket.recv_from(&mut buf) {
-            Ok((len, _from)) => process_incoming_packet(network, local_player.value, &buf[..len]),
+            Ok((len, from)) => {
+                let data = &buf[..len];
+                match network.role {
+                    RuntimeNetRole::LegacyPeer => {
+                        process_incoming_packet(network, local_player.value, data)
+                    }
+                    RuntimeNetRole::UntrustedClient => {
+                        process_client_packet(network, local_player.value, data);
+                    }
+                    RuntimeNetRole::AuthServer => {
+                        process_server_packet(network, from, data, now);
+                    }
+                }
+            }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(_) => break,
         }
@@ -358,6 +524,11 @@ pub fn sync_remote_cubes(
                     RemoteCube {
                         player_id: *player_id,
                     },
+                    crate::player::ChickenBody,
+                    crate::player::WalkCycleState::new(Vec2::new(
+                        state.transform.translation.x,
+                        state.transform.translation.z,
+                    )),
                     crate::player::HeadTurnDelayTimer {
                         elapsed: 0.0,
                         delay_secs: 0.5,
@@ -459,6 +630,198 @@ fn decode_projectile_packet(
     ))
 }
 
+fn process_client_packet(network: &mut NetworkSync, local_player_id: u64, data: &[u8]) {
+    if let Some(nonce) = decode_auth_challenge(data) {
+        if let Some(manager) = network.client_manager.as_mut() {
+            let proof = manager.respond_to_challenge(nonce);
+            let payload = encode_auth_proof(proof);
+            send_payload(network, &payload);
+        }
+        return;
+    }
+
+    if let Some(token) = decode_auth_accept(data) {
+        if let Some(manager) = network.client_manager.as_mut() {
+            manager.mark_authenticated(token);
+        }
+        return;
+    }
+
+    if let Some(states) = decode_snapshot_packet(data) {
+        for (player_id, transform, color) in states {
+            if player_id == local_player_id {
+                network.pending_local_reconciliation = Some(transform);
+                continue;
+            }
+            network.remote_states.insert(
+                player_id,
+                RemoteState {
+                    transform,
+                    color,
+                    last_seen: Instant::now(),
+                },
+            );
+        }
+    }
+}
+
+fn process_server_packet(network: &mut NetworkSync, from: SocketAddr, data: &[u8], now: Instant) {
+    let Some(server) = network.server_runtime.as_mut() else {
+        return;
+    };
+
+    if let Some(player_id) = decode_auth_hello(data) {
+        if let Ok((_session_id, learning::server::ServerEgressPacket::AuthChallenge { nonce })) =
+            server.handle_connection_request(from)
+        {
+            let challenge = encode_auth_challenge(nonce);
+            let _ = network.socket.send_to(&challenge, from);
+            if let Some(session_id) = server.session_by_addr.get(&from).copied()
+                && let Some(session) = server.sessions.get_mut(&session_id)
+            {
+                session.player_id = Some(player_id);
+            }
+        }
+        return;
+    }
+
+    if let Some(proof) = decode_auth_proof(data) {
+        if let Ok(disposition) =
+            server.process_client_packet(from, learning::server::ServerIngressPacket::AuthResponse { proof })
+        {
+            if disposition == learning::server::PacketDisposition::Accepted {
+                if let Some(session_id) = server.session_by_addr.get(&from).copied()
+                    && let Some(session) = server.sessions.get(&session_id)
+                    && let Some(token) = session.session_token
+                    && let Some(player_id) = session.player_id
+                {
+                    let accept = encode_auth_accept(token);
+                    let _ = network.socket.send_to(&accept, from);
+                    network
+                        .remote_states
+                        .entry(player_id)
+                        .or_insert(RemoteState {
+                            transform: Transform::from_xyz(0.0, crate::player::CUBE_REST_Y, 0.0),
+                            color: Color::srgb(0.96, 0.94, 0.88),
+                            last_seen: now,
+                        });
+                }
+            }
+        }
+        return;
+    }
+
+    if let Some((session_token, input_sequence, payload)) = decode_input_packet(data) {
+        if let Ok(disposition) = server.process_client_packet(
+            from,
+            learning::server::ServerIngressPacket::ClientInput {
+                session_token,
+                input_sequence,
+                payload: &payload,
+            },
+        ) {
+            if disposition == learning::server::PacketDisposition::Accepted
+                && let Some(session_id) = server.session_by_addr.get(&from).copied()
+                && let Some(session) = server.sessions.get(&session_id)
+                && let Some(player_id) = session.player_id
+                && let Some((move_x, move_z, jump, color)) = decode_input_payload(&payload)
+            {
+                network.authoritative_inputs.insert(
+                    player_id,
+                    PlayerInputSample {
+                        move_x,
+                        move_z,
+                        jump,
+                        color,
+                    },
+                );
+
+                if let Some(state) = network.remote_states.get_mut(&player_id) {
+                    state.color = color;
+                    state.last_seen = now;
+                }
+            }
+        }
+    }
+}
+
+fn server_broadcast_snapshot(network: &mut NetworkSync) {
+    let Some(server) = network.server_runtime.as_ref() else {
+        return;
+    };
+
+    let snapshot = encode_snapshot_packet(
+        network
+            .remote_states
+            .iter()
+            .map(|(player_id, state)| (*player_id, state.transform, state.color))
+            .collect::<Vec<_>>()
+            .as_slice(),
+    );
+
+    for session in server.sessions.values() {
+        if session.is_authenticated() {
+            let _ = network.socket.send_to(&snapshot, session.addr);
+        }
+    }
+}
+
+fn encode_auth_hello(player_id: u64) -> Vec<u8> {
+    crate::auth_codec::encode_auth_hello(SYNC_MAGIC, SYNC_VERSION, player_id)
+}
+
+fn decode_auth_hello(data: &[u8]) -> Option<u64> {
+    crate::auth_codec::decode_auth_hello(SYNC_MAGIC, SYNC_VERSION, data)
+}
+
+fn encode_auth_challenge(nonce: u64) -> Vec<u8> {
+    crate::auth_codec::encode_auth_challenge(SYNC_MAGIC, SYNC_VERSION, nonce)
+}
+
+fn decode_auth_challenge(data: &[u8]) -> Option<u64> {
+    crate::auth_codec::decode_auth_challenge(SYNC_MAGIC, SYNC_VERSION, data)
+}
+
+fn encode_auth_proof(proof: learning::auth::AuthProof) -> Vec<u8> {
+    crate::auth_codec::encode_auth_proof(SYNC_MAGIC, SYNC_VERSION, proof)
+}
+
+fn decode_auth_proof(data: &[u8]) -> Option<learning::auth::AuthProof> {
+    crate::auth_codec::decode_auth_proof(SYNC_MAGIC, SYNC_VERSION, data)
+}
+
+fn encode_auth_accept(token: learning::auth::SessionToken) -> Vec<u8> {
+    crate::auth_codec::encode_auth_accept(SYNC_MAGIC, SYNC_VERSION, token)
+}
+
+fn decode_auth_accept(data: &[u8]) -> Option<learning::auth::SessionToken> {
+    crate::auth_codec::decode_auth_accept(SYNC_MAGIC, SYNC_VERSION, data)
+}
+
+fn encode_input_payload(move_x: f32, move_z: f32, jump: bool, color: Color) -> Vec<u8> {
+    crate::auth_codec::encode_input_payload(move_x, move_z, jump, color)
+}
+
+fn decode_input_payload(payload: &[u8]) -> Option<(f32, f32, bool, Color)> {
+    crate::auth_codec::decode_input_payload(payload)
+}
+
+fn encode_input_packet(session_token: learning::auth::SessionToken, input_sequence: u32, payload: &[u8]) -> Vec<u8> {
+    crate::auth_codec::encode_input_packet(SYNC_MAGIC, SYNC_VERSION, session_token, input_sequence, payload)
+}
+
+fn decode_input_packet(data: &[u8]) -> Option<(learning::auth::SessionToken, u32, Vec<u8>)> {
+    crate::auth_codec::decode_input_packet(SYNC_MAGIC, SYNC_VERSION, data)
+}
+
+fn encode_snapshot_packet(states: &[(u64, Transform, Color)]) -> Vec<u8> {
+    crate::auth_codec::encode_snapshot_packet(SYNC_MAGIC, SYNC_VERSION, states)
+}
+
+fn decode_snapshot_packet(data: &[u8]) -> Option<Vec<(u64, Transform, Color)>> {
+    crate::auth_codec::decode_snapshot_packet(SYNC_MAGIC, SYNC_VERSION, data)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,6 +836,13 @@ mod tests {
             target_addr: SocketAddr::from(([127, 0, 0, 1], 34567)),
             last_send: Instant::now(),
             presence_state: PresenceState::Pending,
+            role: RuntimeNetRole::LegacyPeer,
+            server_runtime: None,
+            client_manager: None,
+            last_server_broadcast: Instant::now(),
+            authoritative_inputs: HashMap::new(),
+            authoritative_vertical_velocity: HashMap::new(),
+            pending_local_reconciliation: None,
             remote_states: HashMap::new(),
             spawned_entities: HashMap::new(),
             departed_players: HashSet::new(),

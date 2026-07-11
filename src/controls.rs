@@ -8,6 +8,13 @@ pub struct MovementState {
     pub vertical_velocity: f32,
 }
 
+#[derive(Resource, Debug, Default, Clone, Copy)]
+pub struct PlayerInputIntent {
+    pub move_x: f32,
+    pub move_z: f32,
+    pub jump: bool,
+}
+
 #[derive(Resource, Debug, Default, Clone)]
 pub struct MovementFreeze {
     timer: Option<Timer>,
@@ -166,8 +173,10 @@ pub fn move_cube(
     keyboard: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
     bindings: Res<ControlBindings>,
+    ergo: Res<crate::config::HumanErgoConfig>,
     menu_state: Option<Res<crate::ui::EscapeMenuState>>,
     mut movement_state: ResMut<MovementState>,
+    mut input_intent: ResMut<PlayerInputIntent>,
     freeze: Res<MovementFreeze>,
     camera_rig: Query<&CameraOrbitRig>,
     mut query: Query<&mut Transform, With<crate::RotatingCube>>,
@@ -175,11 +184,6 @@ pub fn move_cube(
     if let Some(menu_state) = menu_state && menu_state.is_open {
         return;
     }
-
-    const MOVE_SPEED: f32 = 4.0;
-    const PLANE_LIMIT: f32 = 9.5;
-    const GRAVITY: f32 = 9.81;
-    const JUMP_VELOCITY: f32 = 5.5;
 
     let frozen = freeze.active();
 
@@ -209,24 +213,42 @@ pub fn move_cube(
         let facing = Quat::from_rotation_y(yaw);
         let forward = facing * -Vec3::Z;
         let right = facing * Vec3::X;
-        ((right * direction.x) + (forward * direction.y)).normalize() * MOVE_SPEED * time.delta_secs()
+        ((right * direction.x) + (forward * direction.y)).normalize()
+            * ergo.movement.move_speed
+            * time.delta_secs()
     };
+
+    let normalized_world_input = if horizontal_movement == Vec3::ZERO {
+        Vec3::ZERO
+    } else {
+        horizontal_movement.normalize()
+    };
+
+    input_intent.move_x = normalized_world_input.x;
+    input_intent.move_z = normalized_world_input.z;
+    input_intent.jump = !frozen && keyboard.just_pressed(bindings.jump);
 
     for mut transform in &mut query {
         if !frozen
             && transform.translation.y <= crate::player::CUBE_REST_Y + 0.001
             && keyboard.just_pressed(bindings.jump)
         {
-            movement_state.vertical_velocity = JUMP_VELOCITY;
+            movement_state.vertical_velocity = ergo.movement.jump_velocity;
         }
 
-        movement_state.vertical_velocity -= GRAVITY * time.delta_secs();
+        movement_state.vertical_velocity -= ergo.movement.gravity * time.delta_secs();
 
         transform.translation += horizontal_movement;
         transform.translation.y += movement_state.vertical_velocity * time.delta_secs();
 
-        transform.translation.x = transform.translation.x.clamp(-PLANE_LIMIT, PLANE_LIMIT);
-        transform.translation.z = transform.translation.z.clamp(-PLANE_LIMIT, PLANE_LIMIT);
+        transform.translation.x = transform
+            .translation
+            .x
+            .clamp(-ergo.movement.plane_limit, ergo.movement.plane_limit);
+        transform.translation.z = transform
+            .translation
+            .z
+            .clamp(-ergo.movement.plane_limit, ergo.movement.plane_limit);
 
         if transform.translation.y <= crate::player::CUBE_REST_Y {
             transform.translation.y = crate::player::CUBE_REST_Y;
@@ -238,6 +260,7 @@ pub fn move_cube(
 pub fn mouse_look(
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     accumulated_mouse_motion: Res<AccumulatedMouseMotion>,
+    ergo: Res<crate::config::HumanErgoConfig>,
     menu_state: Option<Res<crate::ui::EscapeMenuState>>,
     mut rig_query: Query<(&mut Transform, &mut CameraOrbitRig)>,
 ) {
@@ -258,12 +281,9 @@ pub fn mouse_look(
         return;
     };
 
-    const SENSITIVITY_X: f32 = 0.003;
-    const SENSITIVITY_Y: f32 = 0.0025;
-    const PITCH_LIMIT: f32 = std::f32::consts::FRAC_PI_2 - 0.1;
-
-    rig.yaw -= delta.x * SENSITIVITY_X;
-    rig.pitch = (rig.pitch - delta.y * SENSITIVITY_Y).clamp(-PITCH_LIMIT, PITCH_LIMIT);
+    rig.yaw -= delta.x * ergo.camera.sensitivity_x;
+    rig.pitch = (rig.pitch - delta.y * ergo.camera.sensitivity_y)
+        .clamp(-ergo.camera.pitch_limit, ergo.camera.pitch_limit);
 
     transform.rotation = Quat::from_euler(EulerRot::YXZ, rig.yaw, rig.pitch, 0.0);
 }

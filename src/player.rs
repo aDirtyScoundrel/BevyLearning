@@ -27,6 +27,27 @@ pub struct ChickenBody;
 #[derive(Component)]
 pub struct Beak;
 
+#[derive(Component)]
+pub struct ChickenLeg {
+    pub phase_offset: f32,
+    pub base_y: f32,
+}
+
+#[derive(Component)]
+pub struct WalkCycleState {
+    pub phase: f32,
+    pub previous_horizontal: Vec2,
+}
+
+impl WalkCycleState {
+    pub fn new(position: Vec2) -> Self {
+        Self {
+            phase: 0.0,
+            previous_horizontal: position,
+        }
+    }
+}
+
 // Constants
 pub const CHICKEN_BODY_RADIUS: f32 = 0.4;
 const CHICKEN_HEAD_RADIUS: f32 = 0.2;
@@ -107,6 +128,10 @@ pub fn spawn_chicken_parts(
         Transform::from_xyz(0.12, -0.575, 0.06),
         GlobalTransform::default(),
         Visibility::default(),
+        ChickenLeg {
+            phase_offset: 0.0,
+            base_y: -0.575,
+        },
     ));
 
     // Right leg
@@ -118,6 +143,10 @@ pub fn spawn_chicken_parts(
         Transform::from_xyz(-0.12, -0.575, 0.06),
         GlobalTransform::default(),
         Visibility::default(),
+        ChickenLeg {
+            phase_offset: std::f32::consts::PI,
+            base_y: -0.575,
+        },
     ));
 
     // Left wing
@@ -191,6 +220,7 @@ pub fn spawn_player_chicken(
             Visibility::default(),
             RotatingCube,
             ChickenBody,
+            WalkCycleState::new(Vec2::new(0.0, 0.0)),
             HeadTurnDelayTimer {
                 elapsed: 0.0,
                 delay_secs: 0.5,
@@ -212,9 +242,11 @@ pub fn flap_wings_on_jump(mut wing_query: Query<&mut Wings>, keyboard: Res<Butto
 }
 
 /// Animates wing flapping with smooth motion
-pub fn animate_wing_flap(mut wing_query: Query<(&mut Transform, &mut Wings)>, time: Res<Time>) {
-    const FLAP_DURATION: f32 = 0.3; // seconds for one complete flap
-    const FLAP_ANGLE: f32 = 0.8; // radians
+pub fn animate_wing_flap(
+    mut wing_query: Query<(&mut Transform, &mut Wings)>,
+    time: Res<Time>,
+    ergo: Res<crate::config::HumanErgoConfig>,
+) {
 
     for (mut transform, mut wing) in wing_query.iter_mut() {
         if !wing.is_flapping {
@@ -223,7 +255,7 @@ pub fn animate_wing_flap(mut wing_query: Query<(&mut Transform, &mut Wings)>, ti
 
         wing.flap_timer += time.delta_secs();
 
-        if wing.flap_timer >= FLAP_DURATION {
+        if wing.flap_timer >= ergo.wing_flap.duration_secs {
             wing.is_flapping = false;
             wing.flap_timer = 0.0;
             // Reset to original rotation based on wing side
@@ -233,8 +265,9 @@ pub fn animate_wing_flap(mut wing_query: Query<(&mut Transform, &mut Wings)>, ti
         }
 
         // Calculate flap animation (sine wave for smooth motion)
-        let progress = wing.flap_timer / FLAP_DURATION;
-        let flap_rotation = (progress * std::f32::consts::PI).sin() * FLAP_ANGLE;
+        let progress = wing.flap_timer / ergo.wing_flap.duration_secs;
+        let flap_rotation =
+            (progress * std::f32::consts::PI).sin() * ergo.wing_flap.angle_radians;
 
         // Determine wing direction
         let base_angle = if transform.translation.x > 0.0 { 0.3 } else { -0.3 };
@@ -243,5 +276,39 @@ pub fn animate_wing_flap(mut wing_query: Query<(&mut Transform, &mut Wings)>, ti
         // Apply flap on top of base rotation
         let new_angle = base_angle + (flap_rotation * side_multiplier);
         transform.rotation = Quat::from_rotation_z(new_angle);
+    }
+}
+
+pub fn animate_walk_cycle(
+    time: Res<Time>,
+    ergo: Res<crate::config::HumanErgoConfig>,
+    mut body_query: Query<(&Transform, &mut WalkCycleState, &Children), With<ChickenBody>>,
+    mut leg_query: Query<(&ChickenLeg, &mut Transform)>,
+) {
+    let dt = time.delta_secs();
+    if dt <= f32::EPSILON {
+        return;
+    }
+
+    for (body_transform, mut walk_state, children) in &mut body_query {
+        let horizontal = Vec2::new(body_transform.translation.x, body_transform.translation.z);
+        let speed = (horizontal - walk_state.previous_horizontal).length() / dt;
+        walk_state.previous_horizontal = horizontal;
+
+        let intensity = (speed / ergo.movement.move_speed).clamp(0.0, 1.0);
+        walk_state.phase += dt * ergo.walk_cycle.cycle_rate * intensity.max(0.1);
+
+        for child in children.iter() {
+            if let Ok((leg, mut leg_transform)) = leg_query.get_mut(child) {
+                let swing = (walk_state.phase + leg.phase_offset).sin()
+                    * ergo.walk_cycle.max_swing_radians
+                    * intensity;
+                let lift = (walk_state.phase + leg.phase_offset).sin().max(0.0)
+                    * ergo.walk_cycle.lift_amount
+                    * intensity;
+                leg_transform.rotation = Quat::from_rotation_x(swing);
+                leg_transform.translation.y = leg.base_y + lift;
+            }
+        }
     }
 }

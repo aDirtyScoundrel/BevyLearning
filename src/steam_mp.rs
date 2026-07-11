@@ -11,6 +11,8 @@ mod imp {
     use bevy::math::primitives::Sphere;
     use bevy::mesh::Mesh3d;
     use bevy::pbr::{MeshMaterial3d, StandardMaterial};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
     use std::collections::{HashMap, HashSet};
     use std::time::{Duration, Instant};
 
@@ -44,18 +46,98 @@ mod imp {
         Announced,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RuntimeSteamRole {
+        LegacyPeer,
+        AuthHost,
+        UntrustedClient,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct SteamInputSample {
+        move_x: f32,
+        move_z: f32,
+        jump: bool,
+        color: Color,
+    }
+
+    impl Default for SteamInputSample {
+        fn default() -> Self {
+            Self {
+                move_x: 0.0,
+                move_z: 0.0,
+                jump: false,
+                color: Color::srgb(0.96, 0.94, 0.88),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct SteamAuthSession {
+        player_id: u64,
+        nonce: u64,
+        token: Option<learning::auth::SessionToken>,
+        last_input_sequence: u32,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SteamClientAuthState {
+        Unauthenticated,
+        AwaitingChallenge,
+        Authenticated,
+    }
+
     #[derive(Resource)]
     pub struct SteamSync {
         pub client: steamworks::Client,
         pub targets: Vec<steamworks::SteamId>,
         pub last_send: Instant,
         presence_state: PresenceState,
+        role: RuntimeSteamRole,
+        auth_secret: String,
+        client_auth_state: SteamClientAuthState,
+        client_session_token: Option<learning::auth::SessionToken>,
+        client_input_sequence: u32,
+        auth_sessions: HashMap<steamworks::SteamId, SteamAuthSession>,
+        authoritative_inputs: HashMap<u64, SteamInputSample>,
+        authoritative_vertical_velocity: HashMap<u64, f32>,
+        pending_local_reconciliation: Option<Transform>,
+        hosted_lobby: Option<steamworks::LobbyId>,
+        joined_lobby: Option<steamworks::LobbyId>,
+        browser_entries: Vec<BrowserEntry>,
+        browser_selected: usize,
+        browser_status: String,
+        browser_mailbox: Arc<Mutex<Vec<BrowserMessage>>>,
+        browser_refresh_in_flight: bool,
         remote_states: HashMap<u64, RemoteState>,
         spawned_entities: HashMap<u64, Entity>,
         departed_players: HashSet<u64>,
         pending_freezes: Vec<u64>,
         pending_projectiles: Vec<crate::scene::ProjectileSpawnData>,
         seen_projectiles: HashMap<(u64, u32), Instant>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct BrowserEntry {
+        lobby: steamworks::LobbyId,
+        owner: steamworks::SteamId,
+        name: String,
+        members: usize,
+        max_members: usize,
+    }
+
+    #[derive(Debug, Clone)]
+    enum BrowserMessage {
+        LobbyList(Result<Vec<steamworks::LobbyId>, String>),
+        JoinResult(Result<steamworks::LobbyId, String>),
+        HostLobbyCreated(Result<steamworks::LobbyId, String>),
+    }
+
+    #[derive(Resource, Default)]
+    pub struct SteamBrowserView {
+        pub status: String,
+        pub rows: Vec<String>,
+        pub selected_index: Option<usize>,
     }
 
     fn send_payload(steam: &SteamSync, payload: &[u8]) {
@@ -74,7 +156,24 @@ mod imp {
         }
     }
 
-    fn process_incoming_packet(steam: &mut SteamSync, local_id: u64, data: &[u8]) {
+    fn process_incoming_packet(
+        steam: &mut SteamSync,
+        remote: steamworks::SteamId,
+        local_id: u64,
+        data: &[u8],
+    ) {
+        match steam.role {
+            RuntimeSteamRole::AuthHost => {
+                process_host_packet(steam, remote, data);
+                return;
+            }
+            RuntimeSteamRole::UntrustedClient => {
+                process_client_packet(steam, local_id, data);
+                return;
+            }
+            RuntimeSteamRole::LegacyPeer => {}
+        }
+
         if let Some((packet_type, player_id, transform, color)) = decode_packet(data) {
             if player_id == local_id {
                 return;
@@ -122,6 +221,17 @@ mod imp {
     }
 
     pub fn setup_steam_sync(mut commands: Commands) {
+        let role = if std::env::var("STEAM_AUTH_HOST")
+            .ok()
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        {
+            RuntimeSteamRole::AuthHost
+        } else if std::env::var("STEAM_AUTH_HOST_ID").is_ok() {
+            RuntimeSteamRole::UntrustedClient
+        } else {
+            RuntimeSteamRole::LegacyPeer
+        };
+
         let targets = std::env::var("STEAM_REMOTE_IDS")
             .ok()
             .map(|raw| {
@@ -132,10 +242,19 @@ mod imp {
             })
             .unwrap_or_default();
 
-        let Ok((client, _single)) = steamworks::Client::init() else {
+        let Ok((client, single)) = steamworks::Client::init() else {
             eprintln!("[steam-mp] Steam API init failed; Steam transport disabled");
             return;
         };
+
+        thread::spawn(move || {
+            loop {
+                single.run_callbacks();
+                thread::sleep(Duration::from_millis(16));
+            }
+        });
+
+        let mailbox: Arc<Mutex<Vec<BrowserMessage>>> = Arc::new(Mutex::new(Vec::new()));
 
         let my_id = client.user().steam_id();
         println!("[steam-mp] local steam id: {}", my_id.raw());
@@ -153,17 +272,54 @@ mod imp {
             println!("[steam-mp] targets: {}", target_list);
         }
 
+        if role == RuntimeSteamRole::AuthHost {
+            let mm = client.matchmaking();
+            let mailbox = mailbox.clone();
+            mm.create_lobby(steamworks::LobbyType::Public, 16, move |res| {
+                let msg = match res {
+                    Ok(lobby) => BrowserMessage::HostLobbyCreated(Ok(lobby)),
+                    Err(err) => BrowserMessage::HostLobbyCreated(Err(format!("{err:?}"))),
+                };
+                if let Ok(mut queue) = mailbox.lock() {
+                    queue.push(msg);
+                }
+            });
+        }
+
         commands.insert_resource(SteamSync {
             client,
             targets,
             last_send: Instant::now(),
             presence_state: PresenceState::Pending,
+            role,
+            auth_secret: std::env::var("STEAM_AUTH_SECRET")
+                .unwrap_or_else(|_| "dev-auth-secret".to_string()),
+            client_auth_state: SteamClientAuthState::Unauthenticated,
+            client_session_token: None,
+            client_input_sequence: 0,
+            auth_sessions: HashMap::new(),
+            authoritative_inputs: HashMap::new(),
+            authoritative_vertical_velocity: HashMap::new(),
+            pending_local_reconciliation: None,
+            hosted_lobby: None,
+            joined_lobby: None,
+            browser_entries: Vec::new(),
+            browser_selected: 0,
+            browser_status: "Steam browser ready. F6 refresh, Up/Down select, F7 join.".to_string(),
+            browser_mailbox: mailbox.clone(),
+            browser_refresh_in_flight: false,
             remote_states: HashMap::new(),
             spawned_entities: HashMap::new(),
             departed_players: HashSet::new(),
             pending_freezes: Vec::new(),
             pending_projectiles: Vec::new(),
             seen_projectiles: HashMap::new(),
+        });
+
+        commands.insert_resource(SteamBrowserView {
+            status: "Steam browser ready. F6 refresh, Up/Down select, F7 join.".to_string(),
+            rows: Vec::new(),
+            selected_index: None,
         });
     }
 
@@ -215,13 +371,22 @@ mod imp {
             return;
         }
 
-        let Ok(transform) = local_cube_query.single() else {
-            return;
-        };
-
         let local_id = steam.client.user().steam_id().raw();
-        let payload = encode_packet(PACKET_JOIN, local_id, transform, hud.selected_color());
-        send_payload(steam, &payload);
+        match steam.role {
+            RuntimeSteamRole::LegacyPeer => {
+                let Ok(transform) = local_cube_query.single() else {
+                    return;
+                };
+                let payload = encode_packet(PACKET_JOIN, local_id, transform, hud.selected_color());
+                send_payload(steam, &payload);
+            }
+            RuntimeSteamRole::UntrustedClient => {
+                let payload = encode_auth_hello(local_id);
+                send_payload(steam, &payload);
+                steam.client_auth_state = SteamClientAuthState::AwaitingChallenge;
+            }
+            RuntimeSteamRole::AuthHost => {}
+        }
 
         steam.presence_state = PresenceState::Announced;
     }
@@ -252,11 +417,196 @@ mod imp {
         send_payload(steam, &payload);
     }
 
-    pub fn process_callbacks() {}
+    pub fn process_callbacks(
+        mut steam: Option<ResMut<SteamSync>>,
+        mut browser_view: Option<ResMut<SteamBrowserView>>,
+    ) {
+        let Some(steam) = steam.as_deref_mut() else {
+            return;
+        };
+
+        process_browser_messages(steam);
+        sync_targets_from_joined_lobby(steam);
+        rebuild_browser_rows(steam, browser_view.as_deref_mut());
+    }
+
+    pub fn update_server_browser_controls(
+        keyboard: Res<ButtonInput<KeyCode>>,
+        mut steam: Option<ResMut<SteamSync>>,
+    ) {
+        let Some(steam) = steam.as_deref_mut() else {
+            return;
+        };
+
+        if keyboard.just_pressed(KeyCode::F6) {
+            request_browser_refresh(steam);
+        }
+
+        if keyboard.just_pressed(KeyCode::ArrowDown) && !steam.browser_entries.is_empty() {
+            steam.browser_selected = (steam.browser_selected + 1).min(steam.browser_entries.len() - 1);
+        }
+
+        if keyboard.just_pressed(KeyCode::ArrowUp) && !steam.browser_entries.is_empty() {
+            steam.browser_selected = steam.browser_selected.saturating_sub(1);
+        }
+
+        if keyboard.just_pressed(KeyCode::F7)
+            && let Some(entry) = steam.browser_entries.get(steam.browser_selected).cloned()
+        {
+            let mailbox = steam.browser_mailbox.clone();
+            steam.client.matchmaking().join_lobby(entry.lobby, move |res| {
+                let msg = match res {
+                    Ok(lobby) => BrowserMessage::JoinResult(Ok(lobby)),
+                    Err(_) => BrowserMessage::JoinResult(Err("join failed".to_string())),
+                };
+                if let Ok(mut queue) = mailbox.lock() {
+                    queue.push(msg);
+                }
+            });
+        }
+    }
+
+    fn request_browser_refresh(steam: &mut SteamSync) {
+        if steam.browser_refresh_in_flight {
+            return;
+        }
+
+        steam.browser_refresh_in_flight = true;
+        let mailbox = steam.browser_mailbox.clone();
+        let mm = steam.client.matchmaking();
+        mm.set_request_lobby_list_result_count_filter(32);
+        mm.request_lobby_list(move |res| {
+            let msg = match res {
+                Ok(lobbies) => BrowserMessage::LobbyList(Ok(lobbies)),
+                Err(err) => BrowserMessage::LobbyList(Err(format!("{err:?}"))),
+            };
+            if let Ok(mut queue) = mailbox.lock() {
+                queue.push(msg);
+            }
+        });
+    }
+
+    fn process_browser_messages(steam: &mut SteamSync) {
+        let mut drained = Vec::new();
+        if let Ok(mut queue) = steam.browser_mailbox.lock() {
+            drained.append(&mut *queue);
+        }
+
+        if drained.is_empty() {
+            return;
+        }
+
+        for msg in drained {
+            match msg {
+                BrowserMessage::LobbyList(result) => {
+                    steam.browser_refresh_in_flight = false;
+                    match result {
+                        Ok(lobbies) => {
+                            steam.browser_entries.clear();
+                            let mm = steam.client.matchmaking();
+                            for lobby in lobbies {
+                                let owner = mm.lobby_owner(lobby);
+                                let members = mm.lobby_member_count(lobby);
+                                let max_members = mm.lobby_member_limit(lobby).unwrap_or(0);
+                                let name = mm
+                                    .lobby_data(lobby, "server_name")
+                                    .map(ToString::to_string)
+                                    .unwrap_or_else(|| format!("Lobby {}", lobby.raw()));
+                                steam.browser_entries.push(BrowserEntry {
+                                    lobby,
+                                    owner,
+                                    name,
+                                    members,
+                                    max_members,
+                                });
+                            }
+                            steam.browser_selected = steam
+                                .browser_selected
+                                .min(steam.browser_entries.len().saturating_sub(1));
+                            steam.browser_status = format!(
+                                "Found {} server(s). F7 join selected.",
+                                steam.browser_entries.len()
+                            );
+                        }
+                        Err(err) => {
+                            steam.browser_status = format!("Refresh failed: {err}");
+                        }
+                    }
+                }
+                BrowserMessage::JoinResult(result) => match result {
+                    Ok(lobby) => {
+                        steam.joined_lobby = Some(lobby);
+                        steam.browser_status = format!("Joined lobby {}", lobby.raw());
+                    }
+                    Err(err) => {
+                        steam.browser_status = format!("Join failed: {err}");
+                    }
+                },
+                BrowserMessage::HostLobbyCreated(result) => match result {
+                    Ok(lobby) => {
+                        steam.hosted_lobby = Some(lobby);
+                        steam.joined_lobby = Some(lobby);
+                        let mm = steam.client.matchmaking();
+                        let my_id = steam.client.user().steam_id().raw();
+                        let _ = mm.set_lobby_data(lobby, "server_name", &format!("Learning Host {my_id}"));
+                        let _ = mm.set_lobby_data(lobby, "game", "learning");
+                        let _ = mm.set_lobby_joinable(lobby, true);
+                    }
+                    Err(_err) => {}
+                },
+            }
+        }
+    }
+
+    fn rebuild_browser_rows(steam: &SteamSync, browser_view: Option<&mut SteamBrowserView>) {
+        let Some(view) = browser_view else {
+            return;
+        };
+
+        view.status = steam.browser_status.clone();
+
+        view.rows = steam
+            .browser_entries
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| {
+                let marker = if idx == steam.browser_selected { ">" } else { " " };
+                format!(
+                    "{} {} [{} / {}] owner:{}",
+                    marker,
+                    entry.name,
+                    entry.members,
+                    entry.max_members,
+                    entry.owner.raw()
+                )
+            })
+            .collect();
+
+        view.selected_index = if steam.browser_entries.is_empty() {
+            None
+        } else {
+            Some(steam.browser_selected)
+        };
+    }
+
+    fn sync_targets_from_joined_lobby(steam: &mut SteamSync) {
+        let Some(lobby) = steam.joined_lobby else {
+            return;
+        };
+        let mm = steam.client.matchmaking();
+        let me = steam.client.user().steam_id();
+        steam.targets = mm
+            .lobby_members(lobby)
+            .into_iter()
+            .filter(|id| *id != me)
+            .collect();
+    }
 
     pub fn send_local_state(
         local_cube_query: Query<&Transform, With<crate::RotatingCube>>,
         hud: Res<crate::ui::HudState>,
+        ergo: Res<crate::config::HumanErgoConfig>,
+        input_intent: Res<crate::controls::PlayerInputIntent>,
         mut steam: Option<ResMut<SteamSync>>,
     ) {
         let Some(steam) = steam.as_deref_mut() else {
@@ -266,13 +616,41 @@ mod imp {
             return;
         }
 
-        let Ok(transform) = local_cube_query.single() else {
-            return;
-        };
-
         let local_id = steam.client.user().steam_id().raw();
-        let payload = encode_packet(PACKET_STATE, local_id, transform, hud.selected_color());
-        send_payload(steam, &payload);
+        match steam.role {
+            RuntimeSteamRole::LegacyPeer => {
+                let Ok(transform) = local_cube_query.single() else {
+                    return;
+                };
+                let payload = encode_packet(PACKET_STATE, local_id, transform, hud.selected_color());
+                send_payload(steam, &payload);
+            }
+            RuntimeSteamRole::UntrustedClient => {
+                if steam.client_auth_state != SteamClientAuthState::Authenticated {
+                    return;
+                }
+                let Some(token) = steam.client_session_token else {
+                    return;
+                };
+
+                steam.client_input_sequence = steam.client_input_sequence.wrapping_add(1);
+                let payload = encode_input_packet(
+                    token,
+                    steam.client_input_sequence,
+                    &encode_input_payload(
+                        input_intent.move_x,
+                        input_intent.move_z,
+                        input_intent.jump,
+                        hud.selected_color(),
+                    ),
+                );
+                send_payload(steam, &payload);
+            }
+            RuntimeSteamRole::AuthHost => {
+                host_step_authoritative_sim(steam, &ergo, SEND_INTERVAL.as_secs_f32());
+                host_broadcast_snapshot(steam);
+            }
+        }
 
         steam.last_send = Instant::now();
     }
@@ -288,10 +666,36 @@ mod imp {
         while let Some(size) = networking.is_p2p_packet_available() {
             let mut buf = vec![0u8; size];
             if let Some((_remote, packet_size)) = networking.read_p2p_packet(&mut buf) {
-                process_incoming_packet(steam, local_id, &buf[..packet_size]);
+                process_incoming_packet(steam, _remote, local_id, &buf[..packet_size]);
             } else {
                 break;
             }
+        }
+    }
+
+    pub fn apply_local_reconciliation(
+        time: Res<Time>,
+        mut steam: Option<ResMut<SteamSync>>,
+        mut local_cube: Query<&mut Transform, With<crate::RotatingCube>>,
+    ) {
+        let Some(steam) = steam.as_deref_mut() else {
+            return;
+        };
+
+        let Some(target) = steam.pending_local_reconciliation else {
+            return;
+        };
+
+        let Ok(mut transform) = local_cube.single_mut() else {
+            return;
+        };
+
+        let alpha = (time.delta_secs() * 12.0).clamp(0.0, 1.0);
+        transform.translation = transform.translation.lerp(target.translation, alpha);
+
+        if transform.translation.distance(target.translation) < 0.01 {
+            transform.translation = target.translation;
+            steam.pending_local_reconciliation = None;
         }
     }
 
@@ -366,6 +770,11 @@ mod imp {
                         SteamRemoteCube {
                             player_id: *player_id,
                         },
+                        crate::player::ChickenBody,
+                        crate::player::WalkCycleState::new(Vec2::new(
+                            state.transform.translation.x,
+                            state.transform.translation.z,
+                        )),
                         crate::player::HeadTurnDelayTimer {
                             elapsed: 0.0,
                             delay_secs: 0.5,
@@ -474,6 +883,238 @@ mod imp {
             },
         ))
     }
+
+    fn process_client_packet(steam: &mut SteamSync, local_id: u64, data: &[u8]) {
+        if let Some(nonce) = decode_auth_challenge(data) {
+            let proof = learning::auth::make_auth_proof(&steam.auth_secret, local_id, nonce);
+            let payload = encode_auth_proof(proof);
+            send_payload(steam, &payload);
+            return;
+        }
+
+        if let Some(token) = decode_auth_accept(data) {
+            steam.client_session_token = Some(token);
+            steam.client_auth_state = SteamClientAuthState::Authenticated;
+            return;
+        }
+
+        if let Some(states) = decode_snapshot_packet(data) {
+            for (player_id, transform, color) in states {
+                if player_id == local_id {
+                    steam.pending_local_reconciliation = Some(transform);
+                    continue;
+                }
+                steam.remote_states.insert(
+                    player_id,
+                    RemoteState {
+                        transform,
+                        color,
+                        last_seen: Instant::now(),
+                    },
+                );
+            }
+        }
+    }
+
+    fn process_host_packet(steam: &mut SteamSync, remote: steamworks::SteamId, data: &[u8]) {
+        if let Some(player_id) = decode_auth_hello(data) {
+            let nonce = steam
+                .auth_sessions
+                .get(&remote)
+                .map(|s| s.nonce)
+                .unwrap_or_else(fresh_nonce);
+            steam.auth_sessions.insert(
+                remote,
+                SteamAuthSession {
+                    player_id,
+                    nonce,
+                    token: None,
+                    last_input_sequence: 0,
+                },
+            );
+            send_payload_to(steam, remote, &encode_auth_challenge(nonce));
+            return;
+        }
+
+        if let Some(proof) = decode_auth_proof(data) {
+            if let Some(session) = steam.auth_sessions.get_mut(&remote)
+                && proof.nonce == session.nonce
+                && proof.player_id == session.player_id
+                && learning::auth::verify_auth_proof(&steam.auth_secret, proof)
+            {
+                let token = learning::auth::mint_session_token(
+                    &steam.auth_secret,
+                    proof.player_id,
+                    proof.nonce,
+                );
+                session.token = Some(token);
+                send_payload_to(steam, remote, &encode_auth_accept(token));
+            }
+            return;
+        }
+
+        if let Some((session_token, input_sequence, payload)) = decode_input_packet(data)
+            && let Some(session) = steam.auth_sessions.get_mut(&remote)
+            && session.token == Some(session_token)
+            && input_sequence > session.last_input_sequence
+            && let Some((move_x, move_z, jump, color)) = decode_input_payload(&payload)
+        {
+            session.last_input_sequence = input_sequence;
+            steam.authoritative_inputs.insert(
+                session.player_id,
+                SteamInputSample {
+                    move_x,
+                    move_z,
+                    jump,
+                    color,
+                },
+            );
+        }
+    }
+
+    fn host_step_authoritative_sim(
+        steam: &mut SteamSync,
+        ergo: &crate::config::HumanErgoConfig,
+        dt: f32,
+    ) {
+        if dt <= f32::EPSILON {
+            return;
+        }
+
+        for (player_id, input) in &steam.authoritative_inputs {
+            let vy = steam
+                .authoritative_vertical_velocity
+                .entry(*player_id)
+                .or_insert(0.0);
+            let state = steam.remote_states.entry(*player_id).or_insert(RemoteState {
+                transform: Transform::from_xyz(0.0, crate::player::CUBE_REST_Y, 0.0),
+                color: input.color,
+                last_seen: Instant::now(),
+            });
+
+            state.transform.translation.x += input.move_x.clamp(-1.0, 1.0) * ergo.movement.move_speed * dt;
+            state.transform.translation.z += input.move_z.clamp(-1.0, 1.0) * ergo.movement.move_speed * dt;
+
+            if input.jump && state.transform.translation.y <= crate::player::CUBE_REST_Y + 0.001 {
+                *vy = ergo.movement.jump_velocity;
+            }
+
+            *vy -= ergo.movement.gravity * dt;
+            state.transform.translation.y += *vy * dt;
+
+            if state.transform.translation.y <= crate::player::CUBE_REST_Y {
+                state.transform.translation.y = crate::player::CUBE_REST_Y;
+                *vy = 0.0;
+            }
+
+            state.transform.translation.x = state
+                .transform
+                .translation
+                .x
+                .clamp(-ergo.movement.plane_limit, ergo.movement.plane_limit);
+            state.transform.translation.z = state
+                .transform
+                .translation
+                .z
+                .clamp(-ergo.movement.plane_limit, ergo.movement.plane_limit);
+            state.color = input.color;
+            state.last_seen = Instant::now();
+        }
+    }
+
+    fn host_broadcast_snapshot(steam: &SteamSync) {
+        let states = steam
+            .remote_states
+            .iter()
+            .map(|(player_id, state)| (*player_id, state.transform, state.color))
+            .collect::<Vec<_>>();
+
+        let payload = encode_snapshot_packet(&states);
+        for (peer, session) in &steam.auth_sessions {
+            if session.token.is_some() {
+                send_payload_to(steam, *peer, &payload);
+            }
+        }
+    }
+
+    fn send_payload_to(steam: &SteamSync, target: steamworks::SteamId, payload: &[u8]) {
+        let networking = steam.client.networking();
+        networking.accept_p2p_session(target);
+        let _ = networking.send_p2p_packet(target, steamworks::SendType::UnreliableNoDelay, payload);
+    }
+
+    fn fresh_nonce() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    }
+
+    fn encode_auth_hello(player_id: u64) -> Vec<u8> {
+        crate::auth_codec::encode_auth_hello(STEAM_SYNC_MAGIC, STEAM_SYNC_VERSION, player_id)
+    }
+
+    fn decode_auth_hello(data: &[u8]) -> Option<u64> {
+        crate::auth_codec::decode_auth_hello(STEAM_SYNC_MAGIC, STEAM_SYNC_VERSION, data)
+    }
+
+    fn encode_auth_challenge(nonce: u64) -> Vec<u8> {
+        crate::auth_codec::encode_auth_challenge(STEAM_SYNC_MAGIC, STEAM_SYNC_VERSION, nonce)
+    }
+
+    fn decode_auth_challenge(data: &[u8]) -> Option<u64> {
+        crate::auth_codec::decode_auth_challenge(STEAM_SYNC_MAGIC, STEAM_SYNC_VERSION, data)
+    }
+
+    fn encode_auth_proof(proof: learning::auth::AuthProof) -> Vec<u8> {
+        crate::auth_codec::encode_auth_proof(STEAM_SYNC_MAGIC, STEAM_SYNC_VERSION, proof)
+    }
+
+    fn decode_auth_proof(data: &[u8]) -> Option<learning::auth::AuthProof> {
+        crate::auth_codec::decode_auth_proof(STEAM_SYNC_MAGIC, STEAM_SYNC_VERSION, data)
+    }
+
+    fn encode_auth_accept(token: learning::auth::SessionToken) -> Vec<u8> {
+        crate::auth_codec::encode_auth_accept(STEAM_SYNC_MAGIC, STEAM_SYNC_VERSION, token)
+    }
+
+    fn decode_auth_accept(data: &[u8]) -> Option<learning::auth::SessionToken> {
+        crate::auth_codec::decode_auth_accept(STEAM_SYNC_MAGIC, STEAM_SYNC_VERSION, data)
+    }
+
+    fn encode_input_payload(move_x: f32, move_z: f32, jump: bool, color: Color) -> Vec<u8> {
+        crate::auth_codec::encode_input_payload(move_x, move_z, jump, color)
+    }
+
+    fn decode_input_payload(payload: &[u8]) -> Option<(f32, f32, bool, Color)> {
+        crate::auth_codec::decode_input_payload(payload)
+    }
+
+    fn encode_input_packet(
+        session_token: learning::auth::SessionToken,
+        input_sequence: u32,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        crate::auth_codec::encode_input_packet(
+            STEAM_SYNC_MAGIC,
+            STEAM_SYNC_VERSION,
+            session_token,
+            input_sequence,
+            payload,
+        )
+    }
+
+    fn decode_input_packet(data: &[u8]) -> Option<(learning::auth::SessionToken, u32, Vec<u8>)> {
+        crate::auth_codec::decode_input_packet(STEAM_SYNC_MAGIC, STEAM_SYNC_VERSION, data)
+    }
+
+    fn encode_snapshot_packet(states: &[(u64, Transform, Color)]) -> Vec<u8> {
+        crate::auth_codec::encode_snapshot_packet(STEAM_SYNC_MAGIC, STEAM_SYNC_VERSION, states)
+    }
+
+    fn decode_snapshot_packet(data: &[u8]) -> Option<Vec<(u64, Transform, Color)>> {
+        crate::auth_codec::decode_snapshot_packet(STEAM_SYNC_MAGIC, STEAM_SYNC_VERSION, data)
+    }
 }
 
 #[cfg(not(feature = "steamworks"))]
@@ -488,8 +1129,16 @@ mod imp {
     #[derive(Resource)]
     pub struct SteamSync;
 
+    #[derive(Resource, Default)]
+    pub struct SteamBrowserView {
+        pub status: String,
+        pub rows: Vec<String>,
+        pub selected_index: Option<usize>,
+    }
+
     pub fn setup_steam_sync(_commands: Commands) {}
-    pub fn process_callbacks() {}
+    pub fn process_callbacks(_browser_view: Option<ResMut<SteamBrowserView>>) {}
+    pub fn update_server_browser_controls(_keyboard: Res<ButtonInput<KeyCode>>) {}
     pub fn send_freeze_target(_steam: &mut SteamSync, _sender_id: u64, _target_id: u64) {}
     pub fn send_projectile_spawn(
         _steam: &mut SteamSync,
@@ -510,6 +1159,11 @@ mod imp {
     }
     pub fn send_local_state(_local_cube_query: Query<&Transform, With<crate::RotatingCube>>) {}
     pub fn receive_remote_states() {}
+    pub fn apply_local_reconciliation(
+        _time: Res<Time>,
+        _local_cube: Query<&mut Transform, With<crate::RotatingCube>>,
+    ) {
+    }
     pub fn sync_remote_cubes(
         _commands: Commands,
         _meshes: ResMut<Assets<Mesh>>,

@@ -1,5 +1,12 @@
 # Patch Notes
 
+## v0.2.0 - 2026-07-11
+
+- Added explicit auth-server and untrusted-client networking flow for LAN and Steam paths with token-gated input ingress.
+- Added shared auth/input/snapshot codec module with packet roundtrip tests to keep transport packet layouts aligned.
+- Added dedicated authoritative server tick integration with config-driven movement tuning and client-side reconciliation toward snapshots.
+- Added in-game Steam lobby-backed server browser with refresh, selection, and join controls plus host lobby advertisement metadata.
+
 ## v0.1.3 - 2026-07-11
 
 - Removed transport-specific send branching from gameplay systems by routing projectile and freeze broadcast through shared runtime helpers.

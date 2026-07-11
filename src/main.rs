@@ -1,4 +1,6 @@
 mod controls;
+mod config;
+mod auth_codec;
 mod multiplayer;
 mod scene;
 mod ui;
@@ -7,6 +9,7 @@ mod steam_mp;
 mod player;
 mod sync_codec;
 mod remote_runtime;
+mod server_tick;
 
 use bevy::dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin};
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
@@ -107,6 +110,16 @@ fn add_player_controller_systems(app: &mut App) {
     )
     .add_systems(
         Update,
+        multiplayer::apply_local_reconciliation
+            .after(controls::move_cube),
+    )
+    .add_systems(
+        Update,
+        steam_mp::apply_local_reconciliation
+            .after(controls::move_cube),
+    )
+    .add_systems(
+        Update,
         steam_mp::apply_local_freeze
             .after(steam_mp::receive_remote_states)
             .before(controls::move_cube),
@@ -140,8 +153,10 @@ fn main() {
                 ..default()
             },
         })
+        .insert_resource(config::HumanErgoConfig::default())
         .insert_resource(controls::ControlBindings::default())
         .insert_resource(controls::MovementState::default())
+        .insert_resource(controls::PlayerInputIntent::default())
         .insert_resource(controls::MovementFreeze::default())
         .insert_resource(scene::ProjectileSequence::default())
         .insert_resource(ExitRequested::default())
@@ -153,7 +168,9 @@ fn main() {
                 steam_mp::setup_steam_sync,
                 scene::setup,
                 ui::setup_hud,
+                ui::setup_steam_server_browser,
                 ui::setup_escape_menu,
+                ui::setup_ergo_panel,
             ),
         )
         .add_systems(
@@ -169,6 +186,8 @@ fn main() {
                 ui::update_material_sliders,
                 ui::update_player_name_stub,
                 ui::update_connected_users_stub,
+                ui::update_steam_server_browser_ui,
+                steam_mp::update_server_browser_controls,
                 steam_mp::process_callbacks,
                 steam_mp::announce_local_presence,
                 steam_mp::receive_remote_states,
@@ -182,6 +201,13 @@ fn main() {
                 multiplayer::send_local_state,
                 style_fps_overlay_shadow,
             ),
+        )
+        .add_systems(
+            Update,
+            (
+                ui::update_ergo_panel,
+                ui::update_ergo_slider_visuals,
+            ),
         );
 
     add_player_controller_systems(&mut app);
@@ -192,6 +218,7 @@ fn main() {
             (
                 player::flap_wings_on_jump,
                 player::animate_wing_flap,
+                player::animate_walk_cycle,
             ),
         )
         .add_systems(
