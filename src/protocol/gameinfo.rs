@@ -112,7 +112,13 @@ impl GameInfo {
         Self::write_huffman_string(writer, &self.mission)?;
 
         // Write player count and max players (4 bits each)
-        let player_count = (self.players.len() as u32).min(15);
+        let player_count = self.players.len() as u32;
+        if player_count > 15 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "GameInfo supports at most 15 players",
+            ));
+        }
         writer.write_bits(player_count, 4)?;
         writer.write_bits(self.max_players.min(15), 4)?;
 
@@ -206,5 +212,21 @@ mod tests {
         assert_eq!(parsed.name, original.name);
         assert_eq!(parsed.game_type, original.game_type);
         assert_eq!(parsed.mission, original.mission);
+    }
+
+    #[test]
+    fn test_gameinfo_rejects_more_than_15_players() {
+        let mut original = GameInfo::new();
+        original.players = (0..16)
+            .map(|idx| PlayerInfo {
+                name: format!("P{}", idx),
+                score: idx as i32,
+                ping: idx,
+            })
+            .collect();
+
+        let mut writer = BitStreamWriter::new();
+        let err = original.to_bitstream(&mut writer).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }

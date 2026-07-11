@@ -5,6 +5,7 @@ mod ui;
 mod skybox;
 mod steam_mp;
 mod player;
+mod sync_codec;
 
 use bevy::dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin};
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;

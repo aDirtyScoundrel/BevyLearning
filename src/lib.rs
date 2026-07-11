@@ -6,6 +6,7 @@
 
 pub mod bitstream;
 pub mod huffman;
+pub mod sync_codec;
 pub mod protocol;
 pub mod connection;
 pub mod packet;

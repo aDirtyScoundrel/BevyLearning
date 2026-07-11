@@ -7,7 +7,7 @@ use bevy::math::primitives::Sphere;
 use bevy::mesh::Mesh3d;
 use bevy::pbr::{MeshMaterial3d, StandardMaterial};
 use bevy::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::env;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -22,6 +22,7 @@ const PACKET_PROJECTILE: u8 = 5;
 const SYNC_PORT: u16 = 34567;
 const SEND_INTERVAL: Duration = Duration::from_millis(50);
 const REMOTE_TIMEOUT: Duration = Duration::from_secs(5);
+const PROJECTILE_DEDUP_TTL: Duration = Duration::from_secs(15);
 const FREEZE_DURATION_SECS: f32 = 2.0;
 
 #[derive(Resource, Debug, Clone, Copy)]
@@ -57,7 +58,7 @@ pub struct NetworkSync {
     departed_players: Vec<u64>,
     pending_freezes: Vec<u64>,
     pending_projectiles: Vec<RemoteProjectileSpawn>,
-    seen_projectiles: HashSet<(u64, u32)>,
+    seen_projectiles: HashMap<(u64, u32), Instant>,
 }
 
 pub fn generate_local_player_id() -> LocalPlayerId {
@@ -111,7 +112,7 @@ pub fn setup_network(mut commands: Commands) {
         departed_players: Vec::new(),
         pending_freezes: Vec::new(),
         pending_projectiles: Vec::new(),
-        seen_projectiles: HashSet::new(),
+        seen_projectiles: HashMap::new(),
     });
 }
 
@@ -232,9 +233,13 @@ pub fn receive_remote_states(
                     network.pending_freezes.push(target_id);
                 } else if let Some((player_id, spawn)) = decode_projectile_packet(&buf[..len]) {
                     if player_id != local_player.value
-                        && network
-                            .seen_projectiles
-                            .insert((player_id, spawn.projectile_id))
+                        && crate::sync_codec::accept_recent_projectile(
+                            &mut network.seen_projectiles,
+                            player_id,
+                            spawn.projectile_id,
+                            Instant::now(),
+                            PROJECTILE_DEDUP_TTL,
+                        )
                     {
                         network.pending_projectiles.push(RemoteProjectileSpawn { spawn });
                     }
@@ -318,6 +323,10 @@ pub fn sync_remote_cubes(
         .remote_states
         .retain(|_, state| now.duration_since(state.last_seen) <= REMOTE_TIMEOUT);
 
+    network
+        .seen_projectiles
+        .retain(|_, seen_at| now.duration_since(*seen_at) <= PROJECTILE_DEDUP_TTL);
+
     for (player_id, state) in &network.remote_states {
         if let Some(entity) = network.spawned_entities.get(player_id).copied() {
             if let Ok((_entity, mut transform, remote, material_handle)) = cube_query.get_mut(entity) {
@@ -378,169 +387,64 @@ fn player_material(color: Color) -> StandardMaterial {
 }
 
 fn encode_state_packet(packet_type: u8, player_id: u64, transform: &Transform, color: Color) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + 1 + 1 + 8 + (3 + 4 + 3) * 4);
-    out.extend_from_slice(&SYNC_MAGIC);
-    out.push(SYNC_VERSION);
-    out.push(packet_type);
-    out.extend_from_slice(&player_id.to_le_bytes());
-
-    out.extend_from_slice(&transform.translation.x.to_le_bytes());
-    out.extend_from_slice(&transform.translation.y.to_le_bytes());
-    out.extend_from_slice(&transform.translation.z.to_le_bytes());
-
-    out.extend_from_slice(&transform.rotation.x.to_le_bytes());
-    out.extend_from_slice(&transform.rotation.y.to_le_bytes());
-    out.extend_from_slice(&transform.rotation.z.to_le_bytes());
-    out.extend_from_slice(&transform.rotation.w.to_le_bytes());
-
-    let srgba = color.to_srgba();
-    out.extend_from_slice(&srgba.red.to_le_bytes());
-    out.extend_from_slice(&srgba.green.to_le_bytes());
-    out.extend_from_slice(&srgba.blue.to_le_bytes());
-
-    out
+    crate::sync_codec::encode_state_packet(
+        SYNC_MAGIC,
+        SYNC_VERSION,
+        packet_type,
+        player_id,
+        transform,
+        color,
+    )
 }
 
 fn encode_freeze_packet(sender_id: u64, target_id: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + 1 + 1 + 8 + 8);
-    out.extend_from_slice(&SYNC_MAGIC);
-    out.push(SYNC_VERSION);
-    out.push(PACKET_FREEZE);
-    out.extend_from_slice(&sender_id.to_le_bytes());
-    out.extend_from_slice(&target_id.to_le_bytes());
-    out
+    crate::sync_codec::encode_freeze_packet(
+        SYNC_MAGIC,
+        SYNC_VERSION,
+        PACKET_FREEZE,
+        sender_id,
+        target_id,
+    )
 }
 
 fn encode_projectile_packet(sender_id: u64, spawn: &crate::scene::ProjectileSpawnData) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + 1 + 1 + 8 + 4 + 7 * 4);
-    out.extend_from_slice(&SYNC_MAGIC);
-    out.push(SYNC_VERSION);
-    out.push(PACKET_PROJECTILE);
-    out.extend_from_slice(&sender_id.to_le_bytes());
-    out.extend_from_slice(&spawn.projectile_id.to_le_bytes());
-    out.extend_from_slice(&spawn.position.x.to_le_bytes());
-    out.extend_from_slice(&spawn.position.y.to_le_bytes());
-    out.extend_from_slice(&spawn.position.z.to_le_bytes());
-    out.extend_from_slice(&spawn.velocity.x.to_le_bytes());
-    out.extend_from_slice(&spawn.velocity.y.to_le_bytes());
-    out.extend_from_slice(&spawn.velocity.z.to_le_bytes());
-    out.extend_from_slice(&spawn.lifetime_secs.to_le_bytes());
-    out
+    crate::sync_codec::encode_projectile_packet(
+        SYNC_MAGIC,
+        SYNC_VERSION,
+        PACKET_PROJECTILE,
+        sender_id,
+        spawn.projectile_id,
+        spawn.position,
+        spawn.velocity,
+        spawn.lifetime_secs,
+    )
 }
 
 fn decode_state_packet(data: &[u8]) -> Option<(u8, u64, Option<Transform>, Option<Color>)> {
-    if data.len() < 4 + 1 + 1 + 8 {
-        return None;
-    }
-    if data[0..4] != SYNC_MAGIC || data[4] != SYNC_VERSION {
-        return None;
-    }
-
-    let packet_type = data[5];
-    let mut idx = 6;
-    let player_id = u64::from_le_bytes(data[idx..idx + 8].try_into().ok()?);
-    idx += 8;
-
-    if packet_type == PACKET_LEAVE {
-        if data.len() != idx {
-            return None;
-        }
-        return Some((packet_type, player_id, None, None));
-    }
-
-    if data.len() != idx + (3 + 4 + 3) * 4 {
-        return None;
-    }
-
-    let read_f32 = |slice: &[u8]| -> Option<f32> {
-        Some(f32::from_le_bytes(slice.try_into().ok()?))
-    };
-
-    let tx = read_f32(&data[idx..idx + 4])?;
-    idx += 4;
-    let ty = read_f32(&data[idx..idx + 4])?;
-    idx += 4;
-    let tz = read_f32(&data[idx..idx + 4])?;
-    idx += 4;
-
-    let rx = read_f32(&data[idx..idx + 4])?;
-    idx += 4;
-    let ry = read_f32(&data[idx..idx + 4])?;
-    idx += 4;
-    let rz = read_f32(&data[idx..idx + 4])?;
-    idx += 4;
-    let rw = read_f32(&data[idx..idx + 4])?;
-    idx += 4;
-
-    let red = read_f32(&data[idx..idx + 4])?;
-    idx += 4;
-    let green = read_f32(&data[idx..idx + 4])?;
-    idx += 4;
-    let blue = read_f32(&data[idx..idx + 4])?;
-
-    let mut transform = Transform::from_xyz(tx, ty, tz);
-    transform.rotation = Quat::from_xyzw(rx, ry, rz, rw);
-
-    Some((packet_type, player_id, Some(transform), Some(Color::srgb(red, green, blue))))
+    crate::sync_codec::decode_state_packet(SYNC_MAGIC, SYNC_VERSION, PACKET_LEAVE, data)
 }
 
 fn decode_freeze_packet(data: &[u8]) -> Option<(u64, u64)> {
-    if data.len() != 4 + 1 + 1 + 8 + 8 {
-        return None;
-    }
-    if data[0..4] != SYNC_MAGIC || data[4] != SYNC_VERSION || data[5] != PACKET_FREEZE {
-        return None;
-    }
-
-    let sender_id = u64::from_le_bytes(data[6..14].try_into().ok()?);
-    let target_id = u64::from_le_bytes(data[14..22].try_into().ok()?);
-    Some((sender_id, target_id))
+    crate::sync_codec::decode_freeze_packet(SYNC_MAGIC, SYNC_VERSION, PACKET_FREEZE, data)
 }
 
 fn decode_projectile_packet(
     data: &[u8],
 ) -> Option<(u64, crate::scene::ProjectileSpawnData)> {
-    if data.len() != 4 + 1 + 1 + 8 + 4 + 7 * 4 {
-        return None;
-    }
-    if data[0..4] != SYNC_MAGIC || data[4] != SYNC_VERSION || data[5] != PACKET_PROJECTILE {
-        return None;
-    }
-
-    let mut idx = 6;
-    let player_id = u64::from_le_bytes(data[idx..idx + 8].try_into().ok()?);
-    idx += 8;
-
-    let projectile_id = u32::from_le_bytes(data[idx..idx + 4].try_into().ok()?);
-    idx += 4;
-
-    let read_f32 = |slice: &[u8]| -> Option<f32> {
-        Some(f32::from_le_bytes(slice.try_into().ok()?))
-    };
-
-    let position = Vec3::new(
-        read_f32(&data[idx..idx + 4])?,
-        read_f32(&data[idx + 4..idx + 8])?,
-        read_f32(&data[idx + 8..idx + 12])?,
-    );
-    idx += 12;
-
-    let velocity = Vec3::new(
-        read_f32(&data[idx..idx + 4])?,
-        read_f32(&data[idx + 4..idx + 8])?,
-        read_f32(&data[idx + 8..idx + 12])?,
-    );
-    idx += 12;
-
-    let lifetime_secs = read_f32(&data[idx..idx + 4])?;
+    let (player_id, spawn) = crate::sync_codec::decode_projectile_packet(
+        SYNC_MAGIC,
+        SYNC_VERSION,
+        PACKET_PROJECTILE,
+        data,
+    )?;
 
     Some((
         player_id,
         crate::scene::ProjectileSpawnData {
-            projectile_id,
-            position,
-            velocity,
-            lifetime_secs,
+            projectile_id: spawn.projectile_id,
+            position: spawn.position,
+            velocity: spawn.velocity,
+            lifetime_secs: spawn.lifetime_secs,
         },
     ))
 }
