@@ -15,7 +15,6 @@ const PANEL_WIDTH: f32 = 280.0;
 const PANEL_HEIGHT: f32 = 288.0;
 const ERGO_PANEL_WIDTH: f32 = 340.0;
 const ERGO_PRESET_PATH: &str = "human_ergo_preset.cfg";
-const ERGO_TOGGLE_KEY: KeyCode = KeyCode::F8;
 
 #[derive(Resource)]
 pub struct HudState {
@@ -627,7 +626,11 @@ pub fn setup_steam_server_browser(mut commands: Commands) {
         });
 }
 
-pub fn setup_ergo_panel(mut commands: Commands, mut ergo: ResMut<crate::config::HumanErgoConfig>) {
+pub fn setup_ergo_panel(
+    mut commands: Commands,
+    mut ergo: ResMut<crate::config::HumanErgoConfig>,
+    bindings: Res<ControlBindings>,
+) {
     let startup_slot = ErgoPresetSlot::from_id(&ergo.autoload_preset_slot)
         .unwrap_or(ErgoPresetSlot::Grounded);
 
@@ -640,7 +643,10 @@ pub fn setup_ergo_panel(mut commands: Commands, mut ergo: ResMut<crate::config::
                 ERGO_PRESET_PATH
             )
         }
-        Err(_) => format!("Ready (toggle with {:?})", ERGO_TOGGLE_KEY),
+        Err(_) => format!(
+            "Ready (toggle with {})",
+            key_label(bindings.key_for(ControlAction::ToggleMachMenu))
+        ),
     };
 
     commands.insert_resource(ErgoPanelState {
@@ -957,8 +963,8 @@ pub fn update_connected_users_stub() {}
 
 pub fn update_steam_server_browser_ui(
     browser: Option<Res<crate::steam_mp::SteamBrowserView>>,
-    mut status_text: Query<&mut Text, With<SteamBrowserStatusText>>,
-    mut rows_text: Query<&mut Text, With<SteamBrowserRowsText>>,
+    mut status_text: Query<&mut Text, (With<SteamBrowserStatusText>, Without<SteamBrowserRowsText>)>,
+    mut rows_text: Query<&mut Text, (With<SteamBrowserRowsText>, Without<SteamBrowserStatusText>)>,
 ) {
     let Some(browser) = browser else {
         return;
@@ -985,13 +991,14 @@ pub fn update_steam_server_browser_ui(
 pub fn update_ergo_panel(
     mut commands: Commands,
     keyboard_input: Res<ButtonInput<KeyCode>>,
+    bindings: Res<ControlBindings>,
     mut ergo: ResMut<crate::config::HumanErgoConfig>,
     mut panel_state: ResMut<ErgoPanelState>,
     mut panel_root: Query<&mut Node, With<ErgoPanelRoot>>,
     changed_sliders: Query<(&SliderValue, &ErgoSlider), Changed<SliderValue>>,
     slider_values: Query<(Entity, &SliderValue, &ErgoSlider)>,
-    mut value_texts: Query<(&mut Text, &ErgoValueText)>,
-    mut status_text: Query<&mut Text, With<ErgoStatusText>>,
+    mut value_texts: Query<(&mut Text, &ErgoValueText), Without<ErgoStatusText>>,
+    mut status_text: Query<&mut Text, (With<ErgoStatusText>, Without<ErgoValueText>)>,
     mut buttons: Query<
         (
             &Interaction,
@@ -1056,7 +1063,7 @@ pub fn update_ergo_panel(
         }
     }
 
-    if keyboard_input.just_pressed(ERGO_TOGGLE_KEY) {
+    if keyboard_input.just_pressed(bindings.key_for(ControlAction::ToggleMachMenu)) {
         panel_state.is_visible = !panel_state.is_visible;
     }
 
@@ -1069,7 +1076,11 @@ pub fn update_ergo_panel(
     }
 
     if let Ok(mut status) = status_text.single_mut() {
-        status.0 = format!("{} | Toggle: {:?}", panel_state.status, ERGO_TOGGLE_KEY);
+        status.0 = format!(
+            "{} | Toggle: {}",
+            panel_state.status,
+            key_label(bindings.key_for(ControlAction::ToggleMachMenu))
+        );
     }
 }
 

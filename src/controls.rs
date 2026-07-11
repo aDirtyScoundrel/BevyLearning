@@ -50,6 +50,7 @@ pub struct CameraOrbitRig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ControlAction {
     TogglePause,
+    ToggleMachMenu,
     ResetVertical,
     ResetSpeed,
     Jump,
@@ -64,8 +65,9 @@ pub enum ControlAction {
 }
 
 impl ControlAction {
-    pub const ALL: [ControlAction; 12] = [
+    pub const ALL: [ControlAction; 13] = [
         ControlAction::TogglePause,
+        ControlAction::ToggleMachMenu,
         ControlAction::ResetVertical,
         ControlAction::ResetSpeed,
         ControlAction::Jump,
@@ -82,6 +84,7 @@ impl ControlAction {
     pub fn label(self) -> &'static str {
         match self {
             ControlAction::TogglePause => "Toggle pause",
+            ControlAction::ToggleMachMenu => "Toggle Mach menu",
             ControlAction::ResetVertical => "Reset vertical speed",
             ControlAction::ResetSpeed => "Reset horizontal speed",
             ControlAction::Jump => "Jump",
@@ -100,6 +103,7 @@ impl ControlAction {
 #[derive(Resource, Debug, Clone)]
 pub struct ControlBindings {
     pub toggle_pause: KeyCode,
+    pub toggle_mach_menu: KeyCode,
     pub reset_vertical: KeyCode,
     pub reset_speed: KeyCode,
     pub jump: KeyCode,
@@ -117,6 +121,7 @@ impl Default for ControlBindings {
     fn default() -> Self {
         Self {
             toggle_pause: KeyCode::KeyF,
+            toggle_mach_menu: KeyCode::F8,
             reset_vertical: KeyCode::KeyX,
             reset_speed: KeyCode::KeyR,
             jump: KeyCode::Space,
@@ -136,6 +141,7 @@ impl ControlBindings {
     pub fn key_for(&self, action: ControlAction) -> KeyCode {
         match action {
             ControlAction::TogglePause => self.toggle_pause,
+            ControlAction::ToggleMachMenu => self.toggle_mach_menu,
             ControlAction::ResetVertical => self.reset_vertical,
             ControlAction::ResetSpeed => self.reset_speed,
             ControlAction::Jump => self.jump,
@@ -153,6 +159,7 @@ impl ControlBindings {
     pub fn set_key(&mut self, action: ControlAction, key: KeyCode) {
         match action {
             ControlAction::TogglePause => self.toggle_pause = key,
+            ControlAction::ToggleMachMenu => self.toggle_mach_menu = key,
             ControlAction::ResetVertical => self.reset_vertical = key,
             ControlAction::ResetSpeed => self.reset_speed = key,
             ControlAction::Jump => self.jump = key,
