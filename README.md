@@ -85,6 +85,54 @@ Notes:
 - Server validates auth proof, issues session token, and broadcasts authoritative snapshots.
 - Untrusted clients reconcile local player position toward server snapshots.
 
+### How To Operate New Server/Client Setup
+
+LAN (quick operator flow):
+
+1. Start one authoritative host process:
+
+```bash
+CUBE_AUTH_SERVER=1 CUBE_AUTH_SECRET=dev-auth-secret cargo run
+```
+
+2. Start one or more client processes pointed at the host:
+
+```bash
+CUBE_AUTH_SERVER_ADDR=<host_ip>:34567 CUBE_AUTH_SECRET=dev-auth-secret cargo run
+```
+
+3. Verify expected behavior:
+
+- Host instance is authoritative for movement state.
+- Clients only send authenticated input + sequence.
+- Remote entities update from authoritative snapshots.
+
+Steam (quick operator flow):
+
+1. Start host with Steam auth-host mode:
+
+```bash
+STEAM_AUTH_HOST=1 STEAM_AUTH_SECRET=dev-auth-secret STEAM_REMOTE_IDS=<client_steam64_id> cargo run --features steamworks
+```
+
+2. Start client pointed at host steam ID:
+
+```bash
+STEAM_AUTH_HOST_ID=<host_steam64_id> STEAM_AUTH_SECRET=dev-auth-secret STEAM_REMOTE_IDS=<host_steam64_id> cargo run --features steamworks
+```
+
+3. Optional browser-driven join in client:
+
+- Press `F6` to refresh lobby/server list.
+- Use `Up`/`Down` to select a row.
+- Press `F7` to join selected host lobby.
+
+Operator notes:
+
+- Keep `CUBE_AUTH_SECRET` / `STEAM_AUTH_SECRET` identical between host and clients.
+- Use host mode on exactly one instance per session.
+- Keep Steam client running for all Steam mode processes.
+
 ### Steamworks P2P sync
 
 Uses Steam P2P packet APIs with explicit peer IDs.
@@ -140,11 +188,46 @@ Include GitHub Release asset upload (requires `GITHUB_TOKEN`):
 GITHUB_TOKEN=... ./scripts/release.sh --version v0.2.0 --upload-release
 ```
 
+Fish shell equivalent:
+
+```fish
+set -x GITHUB_TOKEN <your_token>
+./scripts/release.sh --version v0.2.0 --upload-release
+```
+
+Release upload troubleshooting:
+
+- If you see `--upload-release requires GITHUB_TOKEN in the environment`, set the token in the same terminal session where you run the script.
+- If release creation fails with API errors, verify token permissions include repository write access (classic PAT: `repo`; fine-grained PAT: Contents `Read and write`).
+- After publishing, revoke/rotate temporary tokens used for release automation.
+
 Preview actions without making changes:
 
 ```bash
 ./scripts/release.sh --version v0.2.0 --dry-run
 ```
+
+### Release Checklist
+
+1. Ensure local branch is `main` and clean enough for release.
+2. Ensure version is updated in `Cargo.toml` and notes in `PATCH_NOTES.md`.
+3. Ensure tag exists for release version:
+
+```bash
+git tag --list v0.2.0
+```
+
+4. Run release script:
+
+```bash
+./scripts/release.sh --version v0.2.0 --upload-release
+```
+
+5. Confirm on GitHub:
+
+- Tag is present.
+- Release entry exists.
+- Uploaded asset is attached.
 
 ## Status
 
