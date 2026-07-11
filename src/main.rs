@@ -6,6 +6,7 @@ mod skybox;
 mod steam_mp;
 mod player;
 mod sync_codec;
+mod remote_runtime;
 
 use bevy::dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin};
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;

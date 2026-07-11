@@ -11,7 +11,7 @@ mod imp {
     use bevy::math::primitives::Sphere;
     use bevy::mesh::Mesh3d;
     use bevy::pbr::{MeshMaterial3d, StandardMaterial};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::time::{Duration, Instant};
 
     const STEAM_SYNC_MAGIC: [u8; 4] = *b"STMC";
@@ -38,9 +38,10 @@ mod imp {
         last_seen: Instant,
     }
 
-    #[derive(Debug, Clone, Copy)]
-    struct RemoteProjectileSpawn {
-        spawn: crate::scene::ProjectileSpawnData,
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PresenceState {
+        Pending,
+        Announced,
     }
 
     #[derive(Resource)]
@@ -48,13 +49,76 @@ mod imp {
         pub client: steamworks::Client,
         pub targets: Vec<steamworks::SteamId>,
         pub last_send: Instant,
-        pub announced_presence: bool,
+        presence_state: PresenceState,
         remote_states: HashMap<u64, RemoteState>,
         spawned_entities: HashMap<u64, Entity>,
-        departed_players: Vec<u64>,
+        departed_players: HashSet<u64>,
         pending_freezes: Vec<u64>,
-        pending_projectiles: Vec<RemoteProjectileSpawn>,
+        pending_projectiles: Vec<crate::scene::ProjectileSpawnData>,
         seen_projectiles: HashMap<(u64, u32), Instant>,
+    }
+
+    fn send_payload(steam: &SteamSync, payload: &[u8]) {
+        if steam.targets.is_empty() {
+            return;
+        }
+
+        let networking = steam.client.networking();
+        for target in &steam.targets {
+            networking.accept_p2p_session(*target);
+            let _ = networking.send_p2p_packet(
+                *target,
+                steamworks::SendType::UnreliableNoDelay,
+                payload,
+            );
+        }
+    }
+
+    fn process_incoming_packet(steam: &mut SteamSync, local_id: u64, data: &[u8]) {
+        if let Some((packet_type, player_id, transform, color)) = decode_packet(data) {
+            if player_id == local_id {
+                return;
+            }
+
+            match packet_type {
+                PACKET_STATE | PACKET_JOIN => {
+                    if let (Some(transform), Some(color)) = (transform, color) {
+                        steam.remote_states.insert(
+                            player_id,
+                            RemoteState {
+                                transform,
+                                color,
+                                last_seen: Instant::now(),
+                            },
+                        );
+                    }
+                }
+                PACKET_LEAVE => {
+                    steam.departed_players.insert(player_id);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if let Some((player_id, spawn)) = decode_projectile_packet(data) {
+            if player_id != local_id
+                && crate::sync_codec::accept_recent_projectile(
+                    &mut steam.seen_projectiles,
+                    player_id,
+                    spawn.projectile_id,
+                    Instant::now(),
+                    PROJECTILE_DEDUP_TTL,
+                )
+            {
+                steam.pending_projectiles.push(spawn);
+            }
+            return;
+        }
+
+        if let Some((_sender_id, target_id)) = decode_freeze_packet(data) {
+            steam.pending_freezes.push(target_id);
+        }
     }
 
     pub fn setup_steam_sync(mut commands: Commands) {
@@ -93,10 +157,10 @@ mod imp {
             client,
             targets,
             last_send: Instant::now(),
-            announced_presence: false,
+            presence_state: PresenceState::Pending,
             remote_states: HashMap::new(),
             spawned_entities: HashMap::new(),
-            departed_players: Vec::new(),
+            departed_players: HashSet::new(),
             pending_freezes: Vec::new(),
             pending_projectiles: Vec::new(),
             seen_projectiles: HashMap::new(),
@@ -104,43 +168,17 @@ mod imp {
     }
 
     pub fn send_freeze_target(steam: &mut SteamSync, sender_id: u64, target_id: u64) {
-        if steam.targets.is_empty() {
-            return;
-        }
-
         let payload = encode_freeze_packet(sender_id, target_id);
-        let networking = steam.client.networking();
-
-        for target in &steam.targets {
-            networking.accept_p2p_session(*target);
-            let _ = networking.send_p2p_packet(
-                *target,
-                steamworks::SendType::UnreliableNoDelay,
-                &payload,
-            );
-        }
+        send_payload(steam, &payload);
     }
 
     pub fn send_projectile_spawn(
         steam: &mut SteamSync,
+        sender_id: u64,
         spawn: &crate::scene::ProjectileSpawnData,
     ) {
-        if steam.targets.is_empty() {
-            return;
-        }
-
-        let sender_id = steam.client.user().steam_id().raw();
         let payload = encode_projectile_packet(sender_id, spawn);
-        let networking = steam.client.networking();
-
-        for target in &steam.targets {
-            networking.accept_p2p_session(*target);
-            let _ = networking.send_p2p_packet(
-                *target,
-                steamworks::SendType::UnreliableNoDelay,
-                &payload,
-            );
-        }
+        send_payload(steam, &payload);
     }
 
     pub fn apply_local_freeze(
@@ -173,7 +211,7 @@ mod imp {
             return;
         };
 
-        if steam.announced_presence || steam.targets.is_empty() {
+        if steam.presence_state == PresenceState::Announced || steam.targets.is_empty() {
             return;
         }
 
@@ -183,18 +221,9 @@ mod imp {
 
         let local_id = steam.client.user().steam_id().raw();
         let payload = encode_packet(PACKET_JOIN, local_id, transform, hud.selected_color());
-        let networking = steam.client.networking();
+        send_payload(steam, &payload);
 
-        for target in &steam.targets {
-            networking.accept_p2p_session(*target);
-            let _ = networking.send_p2p_packet(
-                *target,
-                steamworks::SendType::UnreliableNoDelay,
-                &payload,
-            );
-        }
-
-        steam.announced_presence = true;
+        steam.presence_state = PresenceState::Announced;
     }
 
     pub fn send_local_leave(
@@ -220,16 +249,7 @@ mod imp {
 
         let local_id = steam.client.user().steam_id().raw();
         let payload = encode_packet(PACKET_LEAVE, local_id, local_transform, Color::WHITE);
-        let networking = steam.client.networking();
-
-        for target in &steam.targets {
-            networking.accept_p2p_session(*target);
-            let _ = networking.send_p2p_packet(
-                *target,
-                steamworks::SendType::UnreliableNoDelay,
-                &payload,
-            );
-        }
+        send_payload(steam, &payload);
     }
 
     pub fn process_callbacks() {}
@@ -252,16 +272,7 @@ mod imp {
 
         let local_id = steam.client.user().steam_id().raw();
         let payload = encode_packet(PACKET_STATE, local_id, transform, hud.selected_color());
-        let networking = steam.client.networking();
-
-        for target in &steam.targets {
-            networking.accept_p2p_session(*target);
-            let _ = networking.send_p2p_packet(
-                *target,
-                steamworks::SendType::UnreliableNoDelay,
-                &payload,
-            );
-        }
+        send_payload(steam, &payload);
 
         steam.last_send = Instant::now();
     }
@@ -277,41 +288,7 @@ mod imp {
         while let Some(size) = networking.is_p2p_packet_available() {
             let mut buf = vec![0u8; size];
             if let Some((_remote, packet_size)) = networking.read_p2p_packet(&mut buf) {
-                if let Some((packet_type, player_id, transform, color)) = decode_packet(&buf[..packet_size]) {
-                    if player_id == local_id {
-                        continue;
-                    }
-                    match packet_type {
-                        PACKET_STATE | PACKET_JOIN => {
-                            if let (Some(transform), Some(color)) = (transform, color) {
-                                steam.remote_states.insert(
-                                    player_id,
-                                    RemoteState {
-                                        transform,
-                                        color,
-                                        last_seen: Instant::now(),
-                                    },
-                                );
-                            }
-                        }
-                        PACKET_LEAVE => steam.departed_players.push(player_id),
-                        _ => {}
-                    }
-                } else if let Some((player_id, spawn)) = decode_projectile_packet(&buf[..packet_size]) {
-                    if player_id != local_id
-                        && crate::sync_codec::accept_recent_projectile(
-                            &mut steam.seen_projectiles,
-                            player_id,
-                            spawn.projectile_id,
-                            Instant::now(),
-                            PROJECTILE_DEDUP_TTL,
-                        )
-                    {
-                        steam.pending_projectiles.push(RemoteProjectileSpawn { spawn });
-                    }
-                } else if let Some((_sender_id, target_id)) = decode_freeze_packet(&buf[..packet_size]) {
-                    steam.pending_freezes.push(target_id);
-                }
+                process_incoming_packet(steam, local_id, &buf[..packet_size]);
             } else {
                 break;
             }
@@ -328,20 +305,12 @@ mod imp {
             return;
         };
 
-        for remote_projectile in steam.pending_projectiles.drain(..) {
-            let entity = crate::scene::spawn_projectile_entity(
-                &mut commands,
-                &mut meshes,
-                &mut materials,
-                remote_projectile.spawn.position,
-                remote_projectile.spawn.velocity,
-                remote_projectile.spawn.lifetime_secs,
-            );
-
-            commands.entity(entity).insert((
-                crate::scene::ReplicatedProjectileVisual,
-            ));
-        }
+        crate::remote_runtime::drain_remote_projectiles(
+            &mut commands,
+            &mut meshes,
+            &mut materials,
+            &mut steam.pending_projectiles,
+        );
     }
 
     pub fn sync_remote_cubes(
@@ -355,21 +324,25 @@ mod imp {
             return;
         };
 
-        for player_id in steam.departed_players.drain(..) {
-            steam.remote_states.remove(&player_id);
-            if let Some(entity) = steam.spawned_entities.remove(&player_id) {
-                commands.entity(entity).despawn();
-            }
-        }
+        crate::remote_runtime::apply_departures(
+            &mut commands,
+            &mut steam.departed_players,
+            &mut steam.remote_states,
+            &mut steam.spawned_entities,
+        );
 
         let now = Instant::now();
-        steam
-            .remote_states
-            .retain(|_, state| now.duration_since(state.last_seen) <= REMOTE_TIMEOUT);
-
-        steam
-            .seen_projectiles
-            .retain(|_, seen_at| now.duration_since(*seen_at) <= PROJECTILE_DEDUP_TTL);
+        crate::remote_runtime::prune_remote_states(
+            &mut steam.remote_states,
+            now,
+            REMOTE_TIMEOUT,
+            |state| state.last_seen,
+        );
+        crate::remote_runtime::prune_seen_projectiles(
+            &mut steam.seen_projectiles,
+            now,
+            PROJECTILE_DEDUP_TTL,
+        );
 
         for (player_id, state) in &steam.remote_states {
             if let Some(entity) = steam.spawned_entities.get(player_id).copied() {
@@ -520,6 +493,7 @@ mod imp {
     pub fn send_freeze_target(_steam: &mut SteamSync, _sender_id: u64, _target_id: u64) {}
     pub fn send_projectile_spawn(
         _steam: &mut SteamSync,
+        _sender_id: u64,
         _spawn: &crate::scene::ProjectileSpawnData,
     ) {
     }

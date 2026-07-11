@@ -7,7 +7,7 @@ use bevy::math::primitives::Sphere;
 use bevy::mesh::Mesh3d;
 use bevy::pbr::{MeshMaterial3d, StandardMaterial};
 use bevy::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -42,9 +42,10 @@ struct RemoteState {
     last_seen: Instant,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct RemoteProjectileSpawn {
-    spawn: crate::scene::ProjectileSpawnData,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresenceState {
+    Pending,
+    Announced,
 }
 
 #[derive(Resource)]
@@ -52,13 +53,64 @@ pub struct NetworkSync {
     socket: UdpSocket,
     target_addr: SocketAddr,
     last_send: Instant,
-    announced_presence: bool,
+    presence_state: PresenceState,
     remote_states: HashMap<u64, RemoteState>,
     spawned_entities: HashMap<u64, Entity>,
-    departed_players: Vec<u64>,
+    departed_players: HashSet<u64>,
     pending_freezes: Vec<u64>,
-    pending_projectiles: Vec<RemoteProjectileSpawn>,
+    pending_projectiles: Vec<crate::scene::ProjectileSpawnData>,
     seen_projectiles: HashMap<(u64, u32), Instant>,
+}
+
+fn send_payload(network: &NetworkSync, payload: &[u8]) {
+    let _ = network.socket.send_to(payload, network.target_addr);
+}
+
+fn process_incoming_packet(network: &mut NetworkSync, local_player_id: u64, data: &[u8]) {
+    if let Some((_sender_id, target_id)) = decode_freeze_packet(data) {
+        network.pending_freezes.push(target_id);
+        return;
+    }
+
+    if let Some((player_id, spawn)) = decode_projectile_packet(data) {
+        if player_id != local_player_id
+            && crate::sync_codec::accept_recent_projectile(
+                &mut network.seen_projectiles,
+                player_id,
+                spawn.projectile_id,
+                Instant::now(),
+                PROJECTILE_DEDUP_TTL,
+            )
+        {
+            network.pending_projectiles.push(spawn);
+        }
+        return;
+    }
+
+    if let Some((packet_type, player_id, transform, color)) = decode_state_packet(data) {
+        if player_id == local_player_id {
+            return;
+        }
+
+        match packet_type {
+            PACKET_STATE | PACKET_JOIN => {
+                if let (Some(transform), Some(color)) = (transform, color) {
+                    network.remote_states.insert(
+                        player_id,
+                        RemoteState {
+                            transform,
+                            color,
+                            last_seen: Instant::now(),
+                        },
+                    );
+                }
+            }
+            PACKET_LEAVE => {
+                network.departed_players.insert(player_id);
+            }
+            _ => {}
+        }
+    }
 }
 
 pub fn generate_local_player_id() -> LocalPlayerId {
@@ -106,10 +158,10 @@ pub fn setup_network(mut commands: Commands) {
         socket,
         target_addr,
         last_send: Instant::now(),
-        announced_presence: false,
+        presence_state: PresenceState::Pending,
         remote_states: HashMap::new(),
         spawned_entities: HashMap::new(),
-        departed_players: Vec::new(),
+        departed_players: HashSet::new(),
         pending_freezes: Vec::new(),
         pending_projectiles: Vec::new(),
         seen_projectiles: HashMap::new(),
@@ -118,7 +170,7 @@ pub fn setup_network(mut commands: Commands) {
 
 pub fn send_freeze_target(network: &mut NetworkSync, sender_id: u64, target_id: u64) {
     let payload = encode_freeze_packet(sender_id, target_id);
-    let _ = network.socket.send_to(&payload, network.target_addr);
+    send_payload(network, &payload);
 }
 
 pub fn send_projectile_spawn(
@@ -127,7 +179,7 @@ pub fn send_projectile_spawn(
     spawn: &crate::scene::ProjectileSpawnData,
 ) {
     let payload = encode_projectile_packet(sender_id, spawn);
-    let _ = network.socket.send_to(&payload, network.target_addr);
+    send_payload(network, &payload);
 }
 
 pub fn apply_local_freeze(
@@ -159,7 +211,7 @@ pub fn announce_local_presence(
         return;
     };
 
-    if network.announced_presence {
+    if network.presence_state == PresenceState::Announced {
         return;
     }
 
@@ -168,8 +220,8 @@ pub fn announce_local_presence(
     };
 
     let payload = encode_state_packet(PACKET_JOIN, local_player.value, transform, hud.selected_color());
-    let _ = network.socket.send_to(&payload, network.target_addr);
-    network.announced_presence = true;
+    send_payload(network, &payload);
+    network.presence_state = PresenceState::Announced;
 }
 
 pub fn send_local_leave(
@@ -191,7 +243,7 @@ pub fn send_local_leave(
     };
 
     let payload = encode_state_packet(PACKET_LEAVE, local_player.value, transform, Color::WHITE);
-    let _ = network.socket.send_to(&payload, network.target_addr);
+    send_payload(network, &payload);
 }
 
 pub fn send_local_state(
@@ -213,7 +265,7 @@ pub fn send_local_state(
     };
 
     let payload = encode_state_packet(PACKET_STATE, local_player.value, transform, hud.selected_color());
-    let _ = network.socket.send_to(&payload, network.target_addr);
+    send_payload(network, &payload);
     network.last_send = Instant::now();
 }
 
@@ -228,46 +280,7 @@ pub fn receive_remote_states(
     loop {
         let mut buf = [0u8; 96];
         match network.socket.recv_from(&mut buf) {
-            Ok((len, _from)) => {
-                if let Some((_sender_id, target_id)) = decode_freeze_packet(&buf[..len]) {
-                    network.pending_freezes.push(target_id);
-                } else if let Some((player_id, spawn)) = decode_projectile_packet(&buf[..len]) {
-                    if player_id != local_player.value
-                        && crate::sync_codec::accept_recent_projectile(
-                            &mut network.seen_projectiles,
-                            player_id,
-                            spawn.projectile_id,
-                            Instant::now(),
-                            PROJECTILE_DEDUP_TTL,
-                        )
-                    {
-                        network.pending_projectiles.push(RemoteProjectileSpawn { spawn });
-                    }
-                } else if let Some((packet_type, player_id, transform, color)) = decode_state_packet(&buf[..len]) {
-                    if player_id == local_player.value {
-                        continue;
-                    }
-
-                    match packet_type {
-                        PACKET_STATE | PACKET_JOIN => {
-                            if let (Some(transform), Some(color)) = (transform, color) {
-                                network.remote_states.insert(
-                                    player_id,
-                                    RemoteState {
-                                        transform,
-                                        color,
-                                        last_seen: Instant::now(),
-                                    },
-                                );
-                            }
-                        }
-                        PACKET_LEAVE => {
-                            network.departed_players.push(player_id);
-                        }
-                        _ => {}
-                    }
-                }
-            }
+            Ok((len, _from)) => process_incoming_packet(network, local_player.value, &buf[..len]),
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(_) => break,
         }
@@ -284,20 +297,12 @@ pub fn sync_remote_projectiles(
         return;
     };
 
-    for remote_projectile in network.pending_projectiles.drain(..) {
-        let entity = crate::scene::spawn_projectile_entity(
-            &mut commands,
-            &mut meshes,
-            &mut materials,
-            remote_projectile.spawn.position,
-            remote_projectile.spawn.velocity,
-            remote_projectile.spawn.lifetime_secs,
-        );
-
-        commands.entity(entity).insert((
-            crate::scene::ReplicatedProjectileVisual,
-        ));
-    }
+    crate::remote_runtime::drain_remote_projectiles(
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+        &mut network.pending_projectiles,
+    );
 }
 
 pub fn sync_remote_cubes(
@@ -311,21 +316,25 @@ pub fn sync_remote_cubes(
         return;
     };
 
-    for player_id in network.departed_players.drain(..) {
-        network.remote_states.remove(&player_id);
-        if let Some(entity) = network.spawned_entities.remove(&player_id) {
-            commands.entity(entity).despawn();
-        }
-    }
+    crate::remote_runtime::apply_departures(
+        &mut commands,
+        &mut network.departed_players,
+        &mut network.remote_states,
+        &mut network.spawned_entities,
+    );
 
     let now = Instant::now();
-    network
-        .remote_states
-        .retain(|_, state| now.duration_since(state.last_seen) <= REMOTE_TIMEOUT);
-
-    network
-        .seen_projectiles
-        .retain(|_, seen_at| now.duration_since(*seen_at) <= PROJECTILE_DEDUP_TTL);
+    crate::remote_runtime::prune_remote_states(
+        &mut network.remote_states,
+        now,
+        REMOTE_TIMEOUT,
+        |state| state.last_seen,
+    );
+    crate::remote_runtime::prune_seen_projectiles(
+        &mut network.seen_projectiles,
+        now,
+        PROJECTILE_DEDUP_TTL,
+    );
 
     for (player_id, state) in &network.remote_states {
         if let Some(entity) = network.spawned_entities.get(player_id).copied() {

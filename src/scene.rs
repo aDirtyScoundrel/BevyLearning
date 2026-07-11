@@ -472,7 +472,7 @@ pub fn spawn_cone_projectile(
     }
 
     if let Some(steam) = steam_sync.as_deref_mut() {
-        crate::steam_mp::send_projectile_spawn(steam, &spawn_data);
+        crate::steam_mp::send_projectile_spawn(steam, local_player.value, &spawn_data);
     }
 }
 
