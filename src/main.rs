@@ -126,8 +126,39 @@ fn add_player_controller_systems(app: &mut App) {
     );
 }
 
-fn main() {
-    steam_init_guard();
+fn is_server_mode() -> bool {
+    std::env::var("CUBE_AUTH_SERVER")
+        .ok()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+fn run_headless_server() {
+    let local_player_id = multiplayer::generate_local_player_id();
+
+    println!("[server] starting headless authoritative server");
+
+    App::new()
+        .add_plugins(MinimalPlugins)
+        .insert_resource(config::HumanErgoConfig::default())
+        .insert_resource(ExitRequested::default())
+        .insert_resource(local_player_id)
+        .add_systems(Startup, multiplayer::setup_network)
+        .add_systems(
+            Update,
+            (capture_app_exit, multiplayer::send_local_leave).chain(),
+        )
+        .add_systems(
+            Update,
+            (
+                multiplayer::announce_local_presence,
+                multiplayer::receive_remote_states,
+                multiplayer::send_local_state,
+            ),
+        )
+        .run();
+}
+
+fn run_client() {
     let local_player_id = multiplayer::generate_local_player_id();
 
     let mut app = App::new();
@@ -235,6 +266,16 @@ fn main() {
         );
 
     app.run();
+}
+
+fn main() {
+    steam_init_guard();
+
+    if is_server_mode() {
+        run_headless_server();
+    } else {
+        run_client();
+    }
 }
 
 

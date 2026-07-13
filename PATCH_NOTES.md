@@ -1,5 +1,11 @@
 # Patch Notes
 
+## v0.2.2 - 2026-07-13
+
+- Added headless server mode: run with `CUBE_AUTH_SERVER=1` to start authoritative server without rendering or UI.
+- Made `HudState` and `PlayerInputIntent` optional in multiplayer network systems so server mode avoids UI resource panics.
+- Split `main()` into `run_headless_server()` (MinimalPlugins) and `run_client()` (full game app) to isolate server-only dependencies.
+
 ## v0.2.1 - 2026-07-13
 
 - Fixed conflicting `Query` filters in `animate_walk_cycle` by adding `Without<ChickenLeg>` and `Without<ChickenBody>` constraints to disambiguate the body and leg queries.

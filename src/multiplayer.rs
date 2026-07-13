@@ -306,7 +306,7 @@ pub fn apply_local_reconciliation(
 pub fn announce_local_presence(
     local_player: Res<LocalPlayerId>,
     local_cube_query: Query<&Transform, With<crate::RotatingCube>>,
-    hud: Res<crate::ui::HudState>,
+    hud: Option<Res<crate::ui::HudState>>,
     mut network: Option<ResMut<NetworkSync>>,
 ) {
     let Some(network) = network.as_deref_mut() else {
@@ -323,7 +323,7 @@ pub fn announce_local_presence(
             send_payload(network, &payload);
         }
         RuntimeNetRole::LegacyPeer => {
-            let Ok(transform) = local_cube_query.single() else {
+            let (Ok(transform), Some(hud)) = (local_cube_query.single(), hud.as_ref()) else {
                 return;
             };
 
@@ -360,9 +360,9 @@ pub fn send_local_leave(
 pub fn send_local_state(
     local_player: Res<LocalPlayerId>,
     local_cube_query: Query<&Transform, With<crate::RotatingCube>>,
-    hud: Res<crate::ui::HudState>,
+    hud: Option<Res<crate::ui::HudState>>,
     ergo: Res<crate::config::HumanErgoConfig>,
-    input_intent: Res<crate::controls::PlayerInputIntent>,
+    input_intent: Option<Res<crate::controls::PlayerInputIntent>>,
     mut network: Option<ResMut<NetworkSync>>,
 ) {
     let Some(network) = network.as_deref_mut() else {
@@ -375,7 +375,7 @@ pub fn send_local_state(
 
     match network.role {
         RuntimeNetRole::LegacyPeer => {
-            let Ok(transform) = local_cube_query.single() else {
+            let (Ok(transform), Some(hud)) = (local_cube_query.single(), hud.as_ref()) else {
                 return;
             };
 
@@ -384,7 +384,11 @@ pub fn send_local_state(
             network.last_send = Instant::now();
         }
         RuntimeNetRole::UntrustedClient => {
-            let Some(manager) = network.client_manager.as_mut() else {
+            let (Some(manager), Some(hud), Some(input_intent)) = (
+                network.client_manager.as_mut(),
+                hud.as_ref(),
+                input_intent.as_ref(),
+            ) else {
                 return;
             };
             let input_payload = encode_input_payload(
