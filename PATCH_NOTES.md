@@ -1,5 +1,10 @@
 # Patch Notes
 
+## v0.2.1 - 2026-07-13
+
+- Fixed conflicting `Query` filters in `animate_walk_cycle` by adding `Without<ChickenLeg>` and `Without<ChickenBody>` constraints to disambiguate the body and leg queries.
+- Rewrote README to reflect current game state: chicken player, 3D movement, seed projectiles, freeze mechanic, authoritative server architecture, and in-game Steam server browser.
+
 ## v0.2.0 - 2026-07-11
 
 - Added explicit auth-server and untrusted-client networking flow for LAN and Steam paths with token-gated input ingress.

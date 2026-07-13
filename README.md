@@ -1,203 +1,119 @@
-# Learning (Bevy + Tribes Netcode Experiments)
+# Learning
 
-A Rust/Bevy project exploring classic Tribes-style networking, bitstream/Huffman protocol work, and multiplayer cube sync.
+A 3D multiplayer game built with Rust and Bevy. You play as a chicken on a shared floor, moving around, jumping, and shooting seed projectiles at other players. Multiplayer runs over LAN UDP or Steam P2P, with an authoritative server architecture and client-side reconciliation.
 
-## Current Highlights
+## Features
 
-- LSB-first bitstream reader/writer
-- Static Huffman codec implementation
-- Query/protocol scaffolding migrated toward Steamworks/A2S
-- Built-in Bevy FPS diagnostics overlay
-- Keyboard-driven cube controls with acceleration
-- LAN UDP cube sync scaffold
-- Steamworks P2P cube sync scaffold (feature-gated)
+- **Chicken player character** — animated walk cycle, wing flap, head turn delay, and beak cone
+- **3D movement** — WASD + mouse camera orbit, jump, seed projectile firing with hit detection
+- **Movement freeze** — networked freeze effect triggered by projectile hits
+- **Authoritative server tick** — server owns movement state; clients send authenticated input and reconcile toward snapshots
+- **LAN and Steam P2P multiplayer** — both transports share a single packet codec
+- **In-game Steam server browser** — lobby refresh, row selection, and join via keyboard (`F6` / `F7`)
+- **Rebindable controls** — ergo preset system with save/load (`F8` to open)
+- **HUD** — player color picker (hex + sliders for metallic/roughness)
+- **FPS overlay** — built-in frame time diagnostics
+- **Bitstream + Huffman codec** — LSB-first bitstream and static Huffman implementation underlying the packet protocol
+- **A2S / GameInfo query scaffolding** — server info query protocol support
 
 ## Requirements
 
 - Rust toolchain (via rustup)
-- Steam client installed and running for Steamworks mode
-- `steam_appid.txt` is set to `480` for Spacewar development testing
+- Steam client running for Steamworks mode
+- `steam_appid.txt` set to `480` for Spacewar development testing (replace with your app ID for production)
 
 ## Run
 
-Default run:
-
 ```bash
+# Default (LAN, no Steam)
 cargo run
-```
 
-Release run:
-
-```bash
+# Release build
 cargo run --release
-```
 
-Steamworks-enabled run:
-
-```bash
+# Steam P2P enabled
 cargo run --features steamworks
 ```
 
 ## Controls
 
-- `Space`: pause/unpause rotation
-- `Left` / `Right`: decrease/increase horizontal rotation speed while held
-- `R`: reset horizontal speed
-- `Up` / `Down`: increase/decrease vertical rotation speed while held
-- `X`: reset vertical speed
+| Action | Default Key |
+|---|---|
+| Move | `W` `A` `S` `D` |
+| Turn camera | Mouse / `←` `→` |
+| Pitch camera | `↑` `↓` |
+| Jump | `Space` |
+| Shoot seed | Mouse button / configured key |
+| Toggle pause | `F` |
+| Toggle Mach menu (ergo/rebind) | `F8` |
+| Reset vertical speed | `X` |
+| Reset horizontal speed | `R` |
 
-## Multiplayer Scaffolds
+Controls are fully rebindable from the in-game ergo menu. Settings persist to `human_ergo_preset.cfg`.
 
-Trust model note: `src/multiplayer.rs` and `src/steam_mp.rs` are still transitional sync scaffolds.
-The long-term architecture is now split into an authentication server and untrusted clients:
+## Multiplayer
 
-- Server owns authority and only accepts client input after auth challenge/proof + session token issuance.
-- Clients are treated as untrusted and must not be accepted as state authorities.
-- New layout scaffolding lives in `src/server/*`, `src/client/*`, and `src/auth.rs`.
+The networking model uses an authoritative server. Clients send authenticated input packets; the server validates them, advances game state, and broadcasts authoritative snapshots. Clients reconcile local position toward received snapshots.
 
-### LAN UDP sync
+### LAN
 
-Runs automatically and broadcasts transform packets on port `34567`.
-
-Optional explicit target:
-
-```bash
-CUBE_SYNC_TARGET=192.168.1.42:34567 cargo run
-```
-
-### Auth server + untrusted clients (LAN)
-
-Start authoritative auth server:
+**Start host:**
 
 ```bash
 CUBE_AUTH_SERVER=1 CUBE_AUTH_SECRET=dev-auth-secret cargo run
 ```
 
-Start untrusted client targeting that server:
-
-```bash
-CUBE_AUTH_SERVER_ADDR=192.168.1.42:34567 CUBE_AUTH_SECRET=dev-auth-secret cargo run
-```
-
-Notes:
-
-- Clients send authenticated input packets, not authoritative transform state.
-- Server validates auth proof, issues session token, and broadcasts authoritative snapshots.
-- Untrusted clients reconcile local player position toward server snapshots.
-
-### How To Operate New Server/Client Setup
-
-LAN (quick operator flow):
-
-1. Start one authoritative host process:
-
-```bash
-CUBE_AUTH_SERVER=1 CUBE_AUTH_SECRET=dev-auth-secret cargo run
-```
-
-2. Start one or more client processes pointed at the host:
+**Start client:**
 
 ```bash
 CUBE_AUTH_SERVER_ADDR=<host_ip>:34567 CUBE_AUTH_SECRET=dev-auth-secret cargo run
 ```
 
-3. Verify expected behavior:
+- Default port is `34567`.
+- `CUBE_AUTH_SECRET` must match between host and all clients.
+- Run exactly one host per session.
 
-- Host instance is authoritative for movement state.
-- Clients only send authenticated input + sequence.
-- Remote entities update from authoritative snapshots.
+### Steam P2P
 
-Steam (quick operator flow):
-
-1. Start host with Steam auth-host mode:
+**Start host:**
 
 ```bash
 STEAM_AUTH_HOST=1 STEAM_AUTH_SECRET=dev-auth-secret STEAM_REMOTE_IDS=<client_steam64_id> cargo run --features steamworks
 ```
 
-2. Start client pointed at host steam ID:
+**Start client:**
 
 ```bash
 STEAM_AUTH_HOST_ID=<host_steam64_id> STEAM_AUTH_SECRET=dev-auth-secret STEAM_REMOTE_IDS=<host_steam64_id> cargo run --features steamworks
 ```
 
-3. Optional browser-driven join in client:
+- Use comma-separated Steam64 IDs in `STEAM_REMOTE_IDS` for multiple peers.
+- Auth host auto-creates a public Steam lobby and advertises server metadata for the in-game browser.
+- `STEAM_AUTH_SECRET` must match between host and all clients.
 
-- Press `F6` to refresh lobby/server list.
-- Use `Up`/`Down` to select a row.
-- Press `F7` to join selected host lobby.
+**In-game server browser (Steam mode):**
 
-Operator notes:
-
-- Keep `CUBE_AUTH_SECRET` / `STEAM_AUTH_SECRET` identical between host and clients.
-- Use host mode on exactly one instance per session.
-- Keep Steam client running for all Steam mode processes.
-
-### Steamworks P2P sync
-
-Uses Steam P2P packet APIs with explicit peer IDs.
-
-```bash
-STEAM_REMOTE_IDS=<peer_steam64_id> cargo run --features steamworks
-```
-
-Use comma-separated Steam64 IDs for multiple peers.
-
-Auth host + untrusted client mode over Steam P2P:
-
-Host:
-
-```bash
-STEAM_AUTH_HOST=1 STEAM_AUTH_SECRET=dev-auth-secret STEAM_REMOTE_IDS=<peer_steam64_id> cargo run --features steamworks
-```
-
-Client:
-
-```bash
-STEAM_AUTH_HOST_ID=<host_steam64_id> STEAM_AUTH_SECRET=dev-auth-secret STEAM_REMOTE_IDS=<host_steam64_id> cargo run --features steamworks
-```
-
-Notes:
-
-- Client path uses auth challenge/proof, then tokened input packets.
-- Host path simulates authoritative state and publishes snapshots.
-- In-game Steam server browser controls:
-	- `F6`: refresh server list
-	- `Up` / `Down`: select server row
-	- `F7`: join selected server
-- Auth host mode auto-creates a public Steam lobby and advertises `server_name` metadata for browser listing.
-
-## Notes for GitHub Publishing
-
-- `target/` is ignored via `.gitignore`
-- `steam_appid.txt` is for local Spacewar test setup only
-- Do not commit personal secrets/tokens
-- Replace App ID `480` with your real app ID when moving beyond test mode
+- `F6` — refresh lobby list
+- `↑` / `↓` — select a row
+- `F7` — join selected lobby
 
 ## Release Packaging
-
-One-command release workflow:
 
 ```bash
 ./scripts/release.sh --version v0.2.0
 ```
 
-Include GitHub Release asset upload (requires `GITHUB_TOKEN`):
+Upload to GitHub Releases (requires `GITHUB_TOKEN`):
 
 ```bash
-GITHUB_TOKEN=... ./scripts/release.sh --version v0.2.0 --upload-release
+GITHUB_TOKEN=<token> ./scripts/release.sh --version v0.2.0 --upload-release
 ```
 
-Fish shell equivalent:
+## Notes
 
-```fish
-set -x GITHUB_TOKEN <your_token>
-./scripts/release.sh --version v0.2.0 --upload-release
-```
-
-Release upload troubleshooting:
-
-- If you see `--upload-release requires GITHUB_TOKEN in the environment`, set the token in the same terminal session where you run the script.
+- `target/` is gitignored.
+- `steam_appid.txt` is for local Spacewar testing only — do not commit secrets or tokens.
+- Replace App ID `480` with your real Steam app ID before shipping.
 - If release creation fails with API errors, verify token permissions include repository write access (classic PAT: `repo`; fine-grained PAT: Contents `Read and write`).
 - After publishing, revoke/rotate temporary tokens used for release automation.
 

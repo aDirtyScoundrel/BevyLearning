@@ -282,8 +282,11 @@ pub fn animate_wing_flap(
 pub fn animate_walk_cycle(
     time: Res<Time>,
     ergo: Res<crate::config::HumanErgoConfig>,
-    mut body_query: Query<(&Transform, &mut WalkCycleState, &Children), With<ChickenBody>>,
-    mut leg_query: Query<(&ChickenLeg, &mut Transform)>,
+    mut body_query: Query<
+        (&Transform, &mut WalkCycleState, &Children),
+        (With<ChickenBody>, Without<ChickenLeg>),
+    >,
+    mut leg_query: Query<(&ChickenLeg, &mut Transform), (With<ChickenLeg>, Without<ChickenBody>)>,
 ) {
     let dt = time.delta_secs();
     if dt <= f32::EPSILON {
