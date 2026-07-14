@@ -27,6 +27,7 @@ mod imp {
     const REMOTE_TIMEOUT: Duration = Duration::from_secs(5);
     const PROJECTILE_DEDUP_TTL: Duration = Duration::from_secs(15);
     const FREEZE_DURATION_SECS: f32 = 2.0;
+    const METRICS_OVERLAY_TOGGLE_KEY: KeyCode = KeyCode::F5;
 
     #[derive(Component, Debug, Clone, Copy)]
     pub struct SteamRemoteCube {
@@ -61,6 +62,26 @@ mod imp {
         color: Color,
     }
 
+    #[derive(Debug, Default, Clone, Copy)]
+    struct SteamNetMetrics {
+        client_auth_peer_mismatch_drops: u64,
+        client_auth_challenges_received: u64,
+        client_auth_proofs_sent: u64,
+        client_auth_accepts_received: u64,
+        client_input_packets_sent: u64,
+        host_auth_hello_received: u64,
+        host_auth_challenges_sent: u64,
+        host_auth_proofs_received: u64,
+        host_auth_accepts_sent: u64,
+        host_auth_rejects: u64,
+        host_input_packets_received: u64,
+        host_input_packets_accepted: u64,
+        host_token_rejects: u64,
+        host_peer_mismatch_drops: u64,
+        host_replay_drops: u64,
+        host_payload_decode_rejects: u64,
+    }
+
     impl Default for SteamInputSample {
         fn default() -> Self {
             Self {
@@ -77,7 +98,6 @@ mod imp {
         player_id: u64,
         nonce: u64,
         token: Option<learning::auth::SessionToken>,
-        last_input_sequence: u32,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +111,7 @@ mod imp {
     pub struct SteamSync {
         pub client: steamworks::Client,
         pub targets: Vec<steamworks::SteamId>,
+        auth_host: Option<steamworks::SteamId>,
         pub last_send: Instant,
         presence_state: PresenceState,
         role: RuntimeSteamRole,
@@ -99,6 +120,11 @@ mod imp {
         client_session_token: Option<learning::auth::SessionToken>,
         client_input_sequence: u32,
         auth_sessions: HashMap<steamworks::SteamId, SteamAuthSession>,
+        token_to_player: HashMap<learning::auth::SessionToken, u64>,
+        player_ingress_peer: HashMap<u64, steamworks::SteamId>,
+        last_input_sequence_by_player: HashMap<u64, u32>,
+        metrics: SteamNetMetrics,
+        last_metrics_log: Instant,
         authoritative_inputs: HashMap<u64, SteamInputSample>,
         authoritative_vertical_velocity: HashMap<u64, f32>,
         pending_local_reconciliation: Option<Transform>,
@@ -140,6 +166,17 @@ mod imp {
         pub selected_index: Option<usize>,
     }
 
+    #[derive(Resource)]
+    pub struct SteamMetricsOverlayState {
+        pub visible: bool,
+    }
+
+    #[derive(Component)]
+    pub struct SteamMetricsOverlayRoot;
+
+    #[derive(Component)]
+    pub struct SteamMetricsOverlayText;
+
     fn send_payload(steam: &SteamSync, payload: &[u8]) {
         if steam.targets.is_empty() {
             return;
@@ -168,7 +205,7 @@ mod imp {
                 return;
             }
             RuntimeSteamRole::UntrustedClient => {
-                process_client_packet(steam, local_id, data);
+                process_client_packet(steam, remote, local_id, data);
                 return;
             }
             RuntimeSteamRole::LegacyPeer => {}
@@ -242,6 +279,11 @@ mod imp {
             })
             .unwrap_or_default();
 
+        let auth_host = std::env::var("STEAM_AUTH_HOST_ID")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(steamworks::SteamId::from_raw);
+
         let Ok((client, single)) = steamworks::Client::init() else {
             eprintln!("[steam-mp] Steam API init failed; Steam transport disabled");
             return;
@@ -289,6 +331,7 @@ mod imp {
         commands.insert_resource(SteamSync {
             client,
             targets,
+            auth_host,
             last_send: Instant::now(),
             presence_state: PresenceState::Pending,
             role,
@@ -298,6 +341,11 @@ mod imp {
             client_session_token: None,
             client_input_sequence: 0,
             auth_sessions: HashMap::new(),
+            token_to_player: HashMap::new(),
+            player_ingress_peer: HashMap::new(),
+            last_input_sequence_by_player: HashMap::new(),
+            metrics: SteamNetMetrics::default(),
+            last_metrics_log: Instant::now(),
             authoritative_inputs: HashMap::new(),
             authoritative_vertical_velocity: HashMap::new(),
             pending_local_reconciliation: None,
@@ -321,6 +369,36 @@ mod imp {
             rows: Vec::new(),
             selected_index: None,
         });
+    }
+
+    pub fn setup_steam_metrics_overlay(mut commands: Commands) {
+        commands.insert_resource(SteamMetricsOverlayState { visible: false });
+
+        commands
+            .spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(20.0),
+                    top: Val::Px(20.0),
+                    max_width: Val::Px(460.0),
+                    padding: UiRect::all(Val::Px(10.0)),
+                    border: UiRect::all(Val::Px(1.0)),
+                    border_radius: BorderRadius::all(Val::Px(10.0)),
+                    display: Display::None,
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.03, 0.05, 0.08, 0.9)),
+                BorderColor::all(Color::srgba(0.72, 0.84, 0.96, 0.24)),
+                SteamMetricsOverlayRoot,
+            ))
+            .with_children(|parent| {
+                parent.spawn((
+                    Text::new("Steam metrics hidden. Press F5 to toggle."),
+                    TextFont::from_font_size(11.0),
+                    TextColor(Color::srgba(0.88, 0.94, 0.99, 0.95)),
+                    SteamMetricsOverlayText,
+                ));
+            });
     }
 
     pub fn send_freeze_target(steam: &mut SteamSync, sender_id: u64, target_id: u64) {
@@ -382,7 +460,7 @@ mod imp {
             }
             RuntimeSteamRole::UntrustedClient => {
                 let payload = encode_auth_hello(local_id);
-                send_payload(steam, &payload);
+                send_auth_payload_to_host(steam, &payload);
                 steam.client_auth_state = SteamClientAuthState::AwaitingChallenge;
             }
             RuntimeSteamRole::AuthHost => {}
@@ -427,7 +505,44 @@ mod imp {
 
         process_browser_messages(steam);
         sync_targets_from_joined_lobby(steam);
+        log_metrics_if_due(steam);
         rebuild_browser_rows(steam, browser_view.as_deref_mut());
+    }
+
+    pub fn update_steam_metrics_overlay(
+        keyboard: Res<ButtonInput<KeyCode>>,
+        steam: Option<Res<SteamSync>>,
+        mut overlay_state: Option<ResMut<SteamMetricsOverlayState>>,
+        mut root_query: Query<&mut Node, With<SteamMetricsOverlayRoot>>,
+        mut text_query: Query<&mut Text, With<SteamMetricsOverlayText>>,
+    ) {
+        let Some(overlay_state) = overlay_state.as_deref_mut() else {
+            return;
+        };
+
+        if keyboard.just_pressed(METRICS_OVERLAY_TOGGLE_KEY) {
+            overlay_state.visible = !overlay_state.visible;
+        }
+
+        if let Ok(mut root_node) = root_query.single_mut() {
+            root_node.display = if overlay_state.visible {
+                Display::Flex
+            } else {
+                Display::None
+            };
+        }
+
+        if !overlay_state.visible {
+            return;
+        }
+
+        if let Ok(mut text) = text_query.single_mut() {
+            text.0 = match steam.as_deref() {
+                Some(steam) => format_metrics_overlay_text(steam),
+                None => "Steam transport not active. Build with --features steamworks and run Steam client."
+                    .to_string(),
+            };
+        }
     }
 
     pub fn update_server_browser_controls(
@@ -644,7 +759,8 @@ mod imp {
                         hud.selected_color(),
                     ),
                 );
-                send_payload(steam, &payload);
+                steam.metrics.client_input_packets_sent += 1;
+                send_game_payload_to_host(steam, &payload);
             }
             RuntimeSteamRole::AuthHost => {
                 host_step_authoritative_sim(steam, &ergo, SEND_INTERVAL.as_secs_f32());
@@ -884,15 +1000,28 @@ mod imp {
         ))
     }
 
-    fn process_client_packet(steam: &mut SteamSync, local_id: u64, data: &[u8]) {
+    fn process_client_packet(
+        steam: &mut SteamSync,
+        remote: steamworks::SteamId,
+        local_id: u64,
+        data: &[u8],
+    ) {
+        if steam.auth_host.is_some_and(|host| host != remote) {
+            steam.metrics.client_auth_peer_mismatch_drops += 1;
+            return;
+        }
+
         if let Some(nonce) = decode_auth_challenge(data) {
+            steam.metrics.client_auth_challenges_received += 1;
             let proof = learning::auth::make_auth_proof(&steam.auth_secret, local_id, nonce);
             let payload = encode_auth_proof(proof);
-            send_payload(steam, &payload);
+            steam.metrics.client_auth_proofs_sent += 1;
+            send_auth_payload_to_host(steam, &payload);
             return;
         }
 
         if let Some(token) = decode_auth_accept(data) {
+            steam.metrics.client_auth_accepts_received += 1;
             steam.client_session_token = Some(token);
             steam.client_auth_state = SteamClientAuthState::Authenticated;
             return;
@@ -917,7 +1046,20 @@ mod imp {
     }
 
     fn process_host_packet(steam: &mut SteamSync, remote: steamworks::SteamId, data: &[u8]) {
+        if process_host_auth_service_packet(steam, remote, data) {
+            return;
+        }
+
+        process_host_game_service_packet(steam, remote, data);
+    }
+
+    fn process_host_auth_service_packet(
+        steam: &mut SteamSync,
+        remote: steamworks::SteamId,
+        data: &[u8],
+    ) -> bool {
         if let Some(player_id) = decode_auth_hello(data) {
+            steam.metrics.host_auth_hello_received += 1;
             let nonce = steam
                 .auth_sessions
                 .get(&remote)
@@ -929,15 +1071,16 @@ mod imp {
                     player_id,
                     nonce,
                     token: None,
-                    last_input_sequence: 0,
                 },
             );
-            send_payload_to(steam, remote, &encode_auth_challenge(nonce));
-            return;
+            steam.metrics.host_auth_challenges_sent += 1;
+            send_auth_payload_to_peer(steam, remote, &encode_auth_challenge(nonce));
+            return true;
         }
 
         if let Some(proof) = decode_auth_proof(data) {
-            if let Some(session) = steam.auth_sessions.get_mut(&remote)
+            steam.metrics.host_auth_proofs_received += 1;
+            let accepted = if let Some(session) = steam.auth_sessions.get_mut(&remote)
                 && proof.nonce == session.nonce
                 && proof.player_id == session.player_id
                 && learning::auth::verify_auth_proof(&steam.auth_secret, proof)
@@ -948,28 +1091,138 @@ mod imp {
                     proof.nonce,
                 );
                 session.token = Some(token);
-                send_payload_to(steam, remote, &encode_auth_accept(token));
+                steam.token_to_player.insert(token, proof.player_id);
+                steam.metrics.host_auth_accepts_sent += 1;
+                send_auth_payload_to_peer(steam, remote, &encode_auth_accept(token));
+                true
+            } else {
+                false
+            };
+
+            if !accepted {
+                steam.metrics.host_auth_rejects += 1;
             }
-            return;
+            return true;
         }
 
-        if let Some((session_token, input_sequence, payload)) = decode_input_packet(data)
-            && let Some(session) = steam.auth_sessions.get_mut(&remote)
-            && session.token == Some(session_token)
-            && input_sequence > session.last_input_sequence
-            && let Some((move_x, move_z, jump, color)) = decode_input_payload(&payload)
-        {
-            session.last_input_sequence = input_sequence;
-            steam.authoritative_inputs.insert(
-                session.player_id,
-                SteamInputSample {
-                    move_x,
-                    move_z,
-                    jump,
-                    color,
-                },
-            );
+        false
+    }
+
+    fn process_host_game_service_packet(steam: &mut SteamSync, remote: steamworks::SteamId, data: &[u8]) {
+        if let Some((session_token, input_sequence, payload)) = decode_input_packet(data) {
+            steam.metrics.host_input_packets_received += 1;
+
+            let Some(player_id) = steam.token_to_player.get(&session_token).copied() else {
+                steam.metrics.host_token_rejects += 1;
+                return;
+            };
+
+            let accepted_peer = match steam.player_ingress_peer.get(&player_id).copied() {
+                Some(peer) => peer == remote,
+                None => {
+                    steam.player_ingress_peer.insert(player_id, remote);
+                    true
+                }
+            };
+
+            if !accepted_peer {
+                steam.metrics.host_peer_mismatch_drops += 1;
+                return;
+            }
+
+            let last_sequence = steam
+                .last_input_sequence_by_player
+                .get(&player_id)
+                .copied()
+                .unwrap_or(0);
+            if input_sequence <= last_sequence {
+                steam.metrics.host_replay_drops += 1;
+                return;
+            }
+
+            if let Some((move_x, move_z, jump, color)) = decode_input_payload(&payload) {
+                steam
+                    .last_input_sequence_by_player
+                    .insert(player_id, input_sequence);
+                steam.authoritative_inputs.insert(
+                    player_id,
+                    SteamInputSample {
+                        move_x,
+                        move_z,
+                        jump,
+                        color,
+                    },
+                );
+                steam.metrics.host_input_packets_accepted += 1;
+            } else {
+                steam.metrics.host_payload_decode_rejects += 1;
+            }
         }
+    }
+
+    fn log_metrics_if_due(steam: &mut SteamSync) {
+        if steam.last_metrics_log.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        steam.last_metrics_log = Instant::now();
+
+        let role = match steam.role {
+            RuntimeSteamRole::LegacyPeer => "legacy-peer",
+            RuntimeSteamRole::AuthHost => "auth-host",
+            RuntimeSteamRole::UntrustedClient => "untrusted-client",
+        };
+
+        let m = steam.metrics;
+        println!(
+            "[steam-metrics][{}] client_auth_peer_mismatch_drops={} client_auth_challenges_received={} client_auth_proofs_sent={} client_auth_accepts_received={} client_input_packets_sent={} host_auth_hello_received={} host_auth_challenges_sent={} host_auth_proofs_received={} host_auth_accepts_sent={} host_auth_rejects={} host_input_packets_received={} host_input_packets_accepted={} host_token_rejects={} host_peer_mismatch_drops={} host_replay_drops={} host_payload_decode_rejects={}",
+            role,
+            m.client_auth_peer_mismatch_drops,
+            m.client_auth_challenges_received,
+            m.client_auth_proofs_sent,
+            m.client_auth_accepts_received,
+            m.client_input_packets_sent,
+            m.host_auth_hello_received,
+            m.host_auth_challenges_sent,
+            m.host_auth_proofs_received,
+            m.host_auth_accepts_sent,
+            m.host_auth_rejects,
+            m.host_input_packets_received,
+            m.host_input_packets_accepted,
+            m.host_token_rejects,
+            m.host_peer_mismatch_drops,
+            m.host_replay_drops,
+            m.host_payload_decode_rejects,
+        );
+    }
+
+    fn format_metrics_overlay_text(steam: &SteamSync) -> String {
+        let role = match steam.role {
+            RuntimeSteamRole::LegacyPeer => "legacy-peer",
+            RuntimeSteamRole::AuthHost => "auth-host",
+            RuntimeSteamRole::UntrustedClient => "untrusted-client",
+        };
+
+        let m = steam.metrics;
+        format!(
+            "Steam Net Metrics (F5 toggle)\nrole: {}\nclient: challenge_rx={} proof_tx={} accept_rx={} auth_peer_drop={} input_tx={}\nhost: hello_rx={} challenge_tx={} proof_rx={} accept_tx={} auth_reject={}\nhost input: rx={} accepted={} token_reject={} peer_drop={} replay_drop={} payload_reject={}",
+            role,
+            m.client_auth_challenges_received,
+            m.client_auth_proofs_sent,
+            m.client_auth_accepts_received,
+            m.client_auth_peer_mismatch_drops,
+            m.client_input_packets_sent,
+            m.host_auth_hello_received,
+            m.host_auth_challenges_sent,
+            m.host_auth_proofs_received,
+            m.host_auth_accepts_sent,
+            m.host_auth_rejects,
+            m.host_input_packets_received,
+            m.host_input_packets_accepted,
+            m.host_token_rejects,
+            m.host_peer_mismatch_drops,
+            m.host_replay_drops,
+            m.host_payload_decode_rejects,
+        )
     }
 
     fn host_step_authoritative_sim(
@@ -1032,15 +1285,54 @@ mod imp {
         let payload = encode_snapshot_packet(&states);
         for (peer, session) in &steam.auth_sessions {
             if session.token.is_some() {
-                send_payload_to(steam, *peer, &payload);
+                send_game_payload_to_peer(steam, *peer, &payload);
             }
         }
     }
 
-    fn send_payload_to(steam: &SteamSync, target: steamworks::SteamId, payload: &[u8]) {
+    fn send_auth_payload_to_host(steam: &SteamSync, payload: &[u8]) {
+        if let Some(host) = steam.auth_host {
+            send_payload_to(steam, host, payload, steamworks::SendType::Reliable);
+        } else {
+            send_payload(steam, payload);
+        }
+    }
+
+    fn send_game_payload_to_host(steam: &SteamSync, payload: &[u8]) {
+        if let Some(host) = steam.auth_host {
+            send_payload_to(
+                steam,
+                host,
+                payload,
+                steamworks::SendType::UnreliableNoDelay,
+            );
+        } else {
+            send_payload(steam, payload);
+        }
+    }
+
+    fn send_auth_payload_to_peer(steam: &SteamSync, target: steamworks::SteamId, payload: &[u8]) {
+        send_payload_to(steam, target, payload, steamworks::SendType::Reliable);
+    }
+
+    fn send_game_payload_to_peer(steam: &SteamSync, target: steamworks::SteamId, payload: &[u8]) {
+        send_payload_to(
+            steam,
+            target,
+            payload,
+            steamworks::SendType::UnreliableNoDelay,
+        );
+    }
+
+    fn send_payload_to(
+        steam: &SteamSync,
+        target: steamworks::SteamId,
+        payload: &[u8],
+        send_type: steamworks::SendType,
+    ) {
         let networking = steam.client.networking();
         networking.accept_p2p_session(target);
-        let _ = networking.send_p2p_packet(target, steamworks::SendType::UnreliableNoDelay, payload);
+        let _ = networking.send_p2p_packet(target, send_type, payload);
     }
 
     fn fresh_nonce() -> u64 {
@@ -1137,7 +1429,9 @@ mod imp {
     }
 
     pub fn setup_steam_sync(_commands: Commands) {}
+    pub fn setup_steam_metrics_overlay(_commands: Commands) {}
     pub fn process_callbacks(_browser_view: Option<ResMut<SteamBrowserView>>) {}
+    pub fn update_steam_metrics_overlay(_keyboard: Res<ButtonInput<KeyCode>>) {}
     pub fn update_server_browser_controls(_keyboard: Res<ButtonInput<KeyCode>>) {}
     pub fn send_freeze_target(_steam: &mut SteamSync, _sender_id: u64, _target_id: u64) {}
     pub fn send_projectile_spawn(

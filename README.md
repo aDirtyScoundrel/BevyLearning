@@ -59,43 +59,145 @@ Controls are fully rebindable from the in-game ergo menu. Settings persist to `h
 
 ## Multiplayer
 
-The networking model uses an authoritative server. Clients send authenticated input packets; the server validates them, advances game state, and broadcasts authoritative snapshots. Clients reconcile local position toward received snapshots.
+The networking model now uses a true auth-server split inside the authoritative host runtime:
 
-### LAN
+- Auth service path: handles hello/challenge/proof and mints session tokens.
+- Game service path: accepts only token-bound, sequence-validated input and advances simulation.
 
-**Start host:**
+Clients authenticate first, then send gameplay input packets using the issued session token. The server advances game state and broadcasts authoritative snapshots; clients reconcile local position toward received snapshots.
+
+Quick checklist before you start:
+
+1. Build once so dependencies are ready:
+
+```bash
+cargo check
+```
+
+2. If using Steam mode, run Steam client and sign in on every machine.
+3. Use the same auth secret string for everyone in one match.
+4. Open this game in terminal windows side-by-side so host and client logs are visible.
+
+### 60-second sanity test (first time setup)
+
+Use this once to confirm your setup is healthy before tuning anything.
+
+1. Start host terminal first.
+2. Start one client terminal second.
+3. Wait 5 to 10 seconds.
+4. Confirm expected log signals below.
+
+LAN expected host log signals:
+
+- `[server] starting headless authoritative server`
+- `[multiplayer] listening on 0.0.0.0:34567 and broadcasting to ...`
+
+LAN expected client log signals:
+
+- `[multiplayer] listening on 0.0.0.0:34567 and broadcasting to <host_ip>:34567`
+- Local and remote player motion eventually reconcile (no permanent desync).
+
+Steam expected host log signals:
+
+- `[steam-mp] local steam id: ...`
+- Repeating `[steam-metrics]` lines where host auth/input counters increase from zero after client joins.
+
+Steam expected client log signals:
+
+- `[steam-mp] local steam id: ...`
+- Repeating `[steam-metrics]` lines where `challenge_rx`, `proof_tx`, and `accept_rx` move above zero.
+- Press `F5` to open overlay and confirm counters change while moving.
+
+If these signals do not appear:
+
+1. Re-check that host/client use identical auth secret values.
+2. Re-check that host address or host Steam64 ID is correct.
+3. For LAN, verify UDP 34567 is allowed through firewall on host.
+4. For Steam, ensure both users are online in Steam and running with `--features steamworks`.
+
+### Single-machine quick start (2 terminals)
+
+If you just want a fast local test on one PC, open two terminal windows in the project root.
+
+Terminal A (host):
 
 ```bash
 CUBE_AUTH_SERVER=1 CUBE_AUTH_SECRET=dev-auth-secret cargo run
 ```
 
-**Start client:**
+Terminal B (client):
+
+```bash
+CUBE_AUTH_SERVER_ADDR=127.0.0.1:34567 CUBE_AUTH_SECRET=dev-auth-secret cargo run
+```
+
+You should see host and client exchange state within a few seconds.
+
+### LAN
+
+Use this when players are on the same local network and you do not need Steam relay.
+
+1. Pick a host machine.
+2. On host, start server runtime:
+
+```bash
+CUBE_AUTH_SERVER=1 CUBE_AUTH_SECRET=dev-auth-secret cargo run
+```
+
+3. Find host LAN IP (example `192.168.1.20`).
+4. On each client machine, connect to host:
 
 ```bash
 CUBE_AUTH_SERVER_ADDR=<host_ip>:34567 CUBE_AUTH_SECRET=dev-auth-secret cargo run
 ```
 
+Example:
+
+```bash
+CUBE_AUTH_SERVER_ADDR=192.168.1.20:34567 CUBE_AUTH_SECRET=dev-auth-secret cargo run
+```
+
 - Default port is `34567`.
 - `CUBE_AUTH_SECRET` must match between host and all clients.
 - Run exactly one host per session.
+- If clients cannot connect, verify OS firewall allows UDP `34567` on host.
 
 ### Steam P2P
 
-**Start host:**
+Use this when players are on different networks or want Steam NAT traversal.
+
+1. Host and clients launch with Steamworks feature:
+
+```bash
+cargo run --features steamworks
+```
+
+2. Host gets Steam64 ID from startup log line: `[steam-mp] local steam id: ...`
+3. Host starts authoritative Steam auth host:
 
 ```bash
 STEAM_AUTH_HOST=1 STEAM_AUTH_SECRET=dev-auth-secret STEAM_REMOTE_IDS=<client_steam64_id> cargo run --features steamworks
 ```
 
-**Start client:**
+4. Client starts and points at host Steam64 ID:
 
 ```bash
 STEAM_AUTH_HOST_ID=<host_steam64_id> STEAM_AUTH_SECRET=dev-auth-secret STEAM_REMOTE_IDS=<host_steam64_id> cargo run --features steamworks
 ```
 
+Example client command:
+
+```bash
+STEAM_AUTH_HOST_ID=76561198000000000 STEAM_AUTH_SECRET=dev-auth-secret STEAM_REMOTE_IDS=76561198000000000 cargo run --features steamworks
+```
+
 - Use comma-separated Steam64 IDs in `STEAM_REMOTE_IDS` for multiple peers.
 - Auth host auto-creates a public Steam lobby and advertises server metadata for the in-game browser.
 - `STEAM_AUTH_SECRET` must match between host and all clients.
+- Steam auth uses a dedicated auth-service path (hello/challenge/proof/accept) with reliable Steamworks packet send.
+- Steam gameplay uses a separate game-service path (token-bound input + snapshots) over low-latency unreliable send.
+- Runtime prints `[steam-metrics]` every 5s with auth attempts/accepts/rejects plus token, replay, and peer-mismatch drops.
+- Press `F5` in-game to toggle on-screen Steam net metrics overlay.
 
 **In-game server browser (Steam mode):**
 
@@ -106,13 +208,13 @@ STEAM_AUTH_HOST_ID=<host_steam64_id> STEAM_AUTH_SECRET=dev-auth-secret STEAM_REM
 ## Release Packaging
 
 ```bash
-./scripts/release.sh --version v0.3.0
+./scripts/release.sh --version v0.3.1
 ```
 
 Upload to GitHub Releases (requires `GITHUB_TOKEN`):
 
 ```bash
-GITHUB_TOKEN=<token> ./scripts/release.sh --version v0.3.0 --upload-release
+GITHUB_TOKEN=<token> ./scripts/release.sh --version v0.3.1 --upload-release
 ```
 
 ## Notes
@@ -129,7 +231,7 @@ GITHUB_TOKEN=<token> ./scripts/release.sh --version v0.3.0 --upload-release
 Preview actions without making changes:
 
 ```bash
-./scripts/release.sh --version v0.3.0 --dry-run
+./scripts/release.sh --version v0.3.1 --dry-run
 ```
 
 ### Release Checklist
@@ -139,13 +241,13 @@ Preview actions without making changes:
 3. Ensure tag exists for release version:
 
 ```bash
-git tag --list v0.3.0
+git tag --list v0.3.1
 ```
 
 4. Run release script:
 
 ```bash
-./scripts/release.sh --version v0.3.0 --upload-release
+./scripts/release.sh --version v0.3.1 --upload-release
 ```
 
 5. Confirm on GitHub:

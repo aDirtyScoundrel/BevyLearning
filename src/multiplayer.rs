@@ -81,9 +81,12 @@ pub struct NetworkSync {
     last_send: Instant,
     presence_state: PresenceState,
     role: RuntimeNetRole,
-    server_runtime: Option<learning::server::ServerNetworkManager>,
+    auth_runtime: Option<learning::server::ServerNetworkManager>,
     client_manager: Option<learning::client::ClientNetworkManager>,
     last_server_broadcast: Instant,
+    token_to_player: HashMap<learning::auth::SessionToken, u64>,
+    player_ingress_addr: HashMap<u64, SocketAddr>,
+    last_input_sequence_by_player: HashMap<u64, u32>,
     authoritative_inputs: HashMap<u64, PlayerInputSample>,
     authoritative_vertical_velocity: HashMap<u64, f32>,
     pending_local_reconciliation: Option<Transform>,
@@ -198,7 +201,7 @@ pub fn setup_network(mut commands: Commands) {
         })
         .unwrap_or_else(|| SocketAddr::from(([255, 255, 255, 255], SYNC_PORT)));
 
-    let server_runtime = if role == RuntimeNetRole::AuthServer {
+    let auth_runtime = if role == RuntimeNetRole::AuthServer {
         Some(learning::server::ServerNetworkManager::new(
             SocketAddr::from(([0, 0, 0, 0], SYNC_PORT)),
         ))
@@ -229,9 +232,12 @@ pub fn setup_network(mut commands: Commands) {
         last_send: Instant::now(),
         presence_state: PresenceState::Pending,
         role,
-        server_runtime,
+        auth_runtime,
         client_manager,
         last_server_broadcast: Instant::now(),
+        token_to_player: HashMap::new(),
+        player_ingress_addr: HashMap::new(),
+        last_input_sequence_by_player: HashMap::new(),
         authoritative_inputs: HashMap::new(),
         authoritative_vertical_velocity: HashMap::new(),
         pending_local_reconciliation: None,
@@ -670,8 +676,21 @@ fn process_client_packet(network: &mut NetworkSync, local_player_id: u64, data: 
 }
 
 fn process_server_packet(network: &mut NetworkSync, from: SocketAddr, data: &[u8], now: Instant) {
-    let Some(server) = network.server_runtime.as_mut() else {
+    if process_auth_service_packet(network, from, data, now) {
         return;
+    }
+
+    process_game_service_packet(network, from, data, now);
+}
+
+fn process_auth_service_packet(
+    network: &mut NetworkSync,
+    from: SocketAddr,
+    data: &[u8],
+    now: Instant,
+) -> bool {
+    let Some(server) = network.auth_runtime.as_mut() else {
+        return false;
     };
 
     if let Some(player_id) = decode_auth_hello(data) {
@@ -686,71 +705,82 @@ fn process_server_packet(network: &mut NetworkSync, from: SocketAddr, data: &[u8
                 session.player_id = Some(player_id);
             }
         }
-        return;
+        return true;
     }
 
     if let Some(proof) = decode_auth_proof(data) {
         if let Ok(disposition) =
             server.process_client_packet(from, learning::server::ServerIngressPacket::AuthResponse { proof })
+            && disposition == learning::server::PacketDisposition::Accepted
+            && let Some(session_id) = server.session_by_addr.get(&from).copied()
+            && let Some(session) = server.sessions.get(&session_id)
+            && let Some(token) = session.session_token
+            && let Some(player_id) = session.player_id
         {
-            if disposition == learning::server::PacketDisposition::Accepted {
-                if let Some(session_id) = server.session_by_addr.get(&from).copied()
-                    && let Some(session) = server.sessions.get(&session_id)
-                    && let Some(token) = session.session_token
-                    && let Some(player_id) = session.player_id
-                {
-                    let accept = encode_auth_accept(token);
-                    let _ = network.socket.send_to(&accept, from);
-                    network
-                        .remote_states
-                        .entry(player_id)
-                        .or_insert(RemoteState {
-                            transform: Transform::from_xyz(0.0, crate::player::CUBE_REST_Y, 0.0),
-                            color: Color::srgb(0.96, 0.94, 0.88),
-                            last_seen: now,
-                        });
-                }
-            }
+            let accept = encode_auth_accept(token);
+            let _ = network.socket.send_to(&accept, from);
+            network.token_to_player.insert(token, player_id);
+            network.remote_states.entry(player_id).or_insert(RemoteState {
+                transform: Transform::from_xyz(0.0, crate::player::CUBE_REST_Y, 0.0),
+                color: Color::srgb(0.96, 0.94, 0.88),
+                last_seen: now,
+            });
         }
-        return;
+        return true;
     }
 
-    if let Some((session_token, input_sequence, payload)) = decode_input_packet(data) {
-        if let Ok(disposition) = server.process_client_packet(
-            from,
-            learning::server::ServerIngressPacket::ClientInput {
-                session_token,
-                input_sequence,
-                payload: &payload,
-            },
-        ) {
-            if disposition == learning::server::PacketDisposition::Accepted
-                && let Some(session_id) = server.session_by_addr.get(&from).copied()
-                && let Some(session) = server.sessions.get(&session_id)
-                && let Some(player_id) = session.player_id
-                && let Some((move_x, move_z, jump, color)) = decode_input_payload(&payload)
-            {
-                network.authoritative_inputs.insert(
-                    player_id,
-                    PlayerInputSample {
-                        move_x,
-                        move_z,
-                        jump,
-                        color,
-                    },
-                );
+    false
+}
 
-                if let Some(state) = network.remote_states.get_mut(&player_id) {
-                    state.color = color;
-                    state.last_seen = now;
-                }
+fn process_game_service_packet(network: &mut NetworkSync, from: SocketAddr, data: &[u8], now: Instant) {
+    if let Some((session_token, input_sequence, payload)) = decode_input_packet(data)
+        && let Some(player_id) = network.token_to_player.get(&session_token).copied()
+    {
+        let accepted_addr = match network.player_ingress_addr.get(&player_id).copied() {
+            Some(addr) => addr == from,
+            None => {
+                network.player_ingress_addr.insert(player_id, from);
+                true
+            }
+        };
+
+        if !accepted_addr {
+            return;
+        }
+
+        let last_sequence = network
+            .last_input_sequence_by_player
+            .get(&player_id)
+            .copied()
+            .unwrap_or(0);
+        if input_sequence <= last_sequence {
+            return;
+        }
+
+        if let Some((move_x, move_z, jump, color)) = decode_input_payload(&payload) {
+            network
+                .last_input_sequence_by_player
+                .insert(player_id, input_sequence);
+            network.authoritative_inputs.insert(
+                player_id,
+                PlayerInputSample {
+                    move_x,
+                    move_z,
+                    jump,
+                    color,
+                },
+            );
+
+            if let Some(state) = network.remote_states.get_mut(&player_id) {
+                state.color = color;
+                state.last_seen = now;
             }
         }
     }
 }
 
 fn server_broadcast_snapshot(network: &mut NetworkSync) {
-    let Some(server) = network.server_runtime.as_ref() else {
+    let Some(server) = network.auth_runtime.as_ref() else {
         return;
     };
 
@@ -841,9 +871,12 @@ mod tests {
             last_send: Instant::now(),
             presence_state: PresenceState::Pending,
             role: RuntimeNetRole::LegacyPeer,
-            server_runtime: None,
+            auth_runtime: None,
             client_manager: None,
             last_server_broadcast: Instant::now(),
+            token_to_player: HashMap::new(),
+            player_ingress_addr: HashMap::new(),
+            last_input_sequence_by_player: HashMap::new(),
             authoritative_inputs: HashMap::new(),
             authoritative_vertical_velocity: HashMap::new(),
             pending_local_reconciliation: None,

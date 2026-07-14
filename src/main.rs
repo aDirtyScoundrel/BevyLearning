@@ -206,6 +206,7 @@ fn run_client() {
             (
                 multiplayer::setup_network,
                 steam_mp::setup_steam_sync,
+                steam_mp::setup_steam_metrics_overlay,
                 scene::setup,
                 ui::setup_hud,
                 ui::setup_wad_picker,
@@ -243,6 +244,7 @@ fn run_client() {
                 style_fps_overlay_shadow,
             ),
         )
+        .add_systems(Update, steam_mp::update_steam_metrics_overlay)
         .add_systems(Update, ui::update_wad_picker)
         .add_systems(Update, scene::update_collision_debug_visibility)
         .add_systems(Update, doom_wad::update_wad_doors)
