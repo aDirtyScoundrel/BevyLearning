@@ -1,5 +1,13 @@
 # Patch Notes
 
+## v0.3.0 - 2026-07-14
+
+- Added DOOM level container support across WAD, PK3, and ZIP map packs, including direct UDMF TEXTMAP parsing and nested archive map discovery.
+- Added in-game runtime level selection and reload flow with status reporting, plus collision debug wireframe visibility toggles.
+- Added map-aware collision and dynamic door behavior improvements, including better traversable step handling and linedef format compatibility.
+- Added noclip toggle (F11) and tightened player start selection to prefer level-designer Player 1 starts with fallback start types.
+- Added player-scale control in the ergo panel and integrated map spawn transforms into startup and runtime reload placement.
+
 ## v0.2.2 - 2026-07-13
 
 - Added headless server mode: run with `CUBE_AUTH_SERVER=1` to start authoritative server without rendering or UI.

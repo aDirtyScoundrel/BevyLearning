@@ -20,6 +20,34 @@ use crate::RotatingCube;
 #[derive(Component)]
 pub struct CameraAimCone;
 
+#[derive(Component)]
+pub struct LevelGeometry;
+
+#[derive(Component)]
+pub struct CollisionDebugVisual;
+
+#[derive(Resource, Debug, Clone, Copy)]
+pub struct CollisionDebugState {
+    pub visible: bool,
+}
+
+impl Default for CollisionDebugState {
+    fn default() -> Self {
+        Self { visible: false }
+    }
+}
+
+#[derive(Message, Clone)]
+pub struct ReloadLevelRequest {
+    pub wad_path: String,
+    pub map_name: String,
+}
+
+#[derive(Resource, Default)]
+pub struct LevelLoadStatus {
+    pub text: String,
+}
+
 const FLOOR_HALF_EXTENT: f32 = 12.0;
 const FLOOR_TEXTURE_SIZE: u32 = 512;
 const FLOOR_TEXTURE_REPEAT: f32 = 10.0;
@@ -202,14 +230,37 @@ fn create_floor_reference_image() -> Image {
     image
 }
 
+pub fn spawn_default_floor(
+    commands: &mut Commands,
+    images: &mut Assets<Image>,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+) {
+    let floor_texture = images.add(create_floor_reference_image());
+    commands.spawn((
+        Mesh3d(meshes.add(Plane3d::new(Vec3::Y, Vec2::splat(FLOOR_HALF_EXTENT)).mesh().build())),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::WHITE,
+            base_color_texture: Some(floor_texture),
+            perceptual_roughness: 0.9,
+            uv_transform: Affine2::from_scale(Vec2::splat(FLOOR_TEXTURE_REPEAT)),
+            ..default()
+        })),
+        Transform::default(),
+        GlobalTransform::default(),
+        LevelGeometry,
+    ));
+}
+
 pub fn setup(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut ergo: ResMut<crate::config::HumanErgoConfig>,
+    mut level_status: ResMut<LevelLoadStatus>,
 ) {
     let skybox_handle = images.add(create_skybox_image());
-    let floor_texture = images.add(create_floor_reference_image());
 
     commands.spawn((
         DirectionalLight {
@@ -221,7 +272,23 @@ pub fn setup(
         GlobalTransform::default(),
     ));
 
-    spawn_player_chicken(&mut commands, &mut meshes, &mut materials);
+    let level_spawn_info = crate::doom_wad::spawn_level_from_env(&mut commands, &mut meshes, &mut materials);
+    let player_spawn_transform = level_spawn_info
+        .as_ref()
+        .map(|info| Transform::from_translation(info.player_spawn).with_rotation(Quat::from_rotation_y(info.player_yaw)))
+        .unwrap_or(Transform::from_xyz(0.0, CUBE_REST_Y, 0.0));
+
+    if let Some(level_spawn_info) = level_spawn_info {
+        ergo.movement.plane_limit = ergo
+            .movement
+            .plane_limit
+            .max(level_spawn_info.suggested_plane_limit);
+        level_status.text = "Loaded WAD from startup environment".to_string();
+    } else {
+        level_status.text = "Using default floor".to_string();
+    }
+
+    spawn_player_chicken(&mut commands, &mut meshes, &mut materials, player_spawn_transform);
 
     commands.spawn((
         Mesh3d(meshes.add(Cone::new(AIM_CONE_RADIUS, AIM_CONE_HEIGHT).mesh().build())),
@@ -263,18 +330,93 @@ pub fn setup(
             ));
         });
 
-    commands.spawn((
-        Mesh3d(meshes.add(Plane3d::new(Vec3::Y, Vec2::splat(FLOOR_HALF_EXTENT)).mesh().build())),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::WHITE,
-            base_color_texture: Some(floor_texture),
-            perceptual_roughness: 0.9,
-            uv_transform: Affine2::from_scale(Vec2::splat(FLOOR_TEXTURE_REPEAT)),
-            ..default()
-        })),
-        Transform::default(),
-        GlobalTransform::default(),
-    ));
+    if level_spawn_info.is_none() {
+        spawn_default_floor(&mut commands, &mut images, &mut meshes, &mut materials);
+    }
+}
+
+pub fn handle_reload_level_requests(
+    mut commands: Commands,
+    mut requests: MessageReader<ReloadLevelRequest>,
+    mut images: ResMut<Assets<Image>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut ergo: ResMut<crate::config::HumanErgoConfig>,
+    mut level_status: ResMut<LevelLoadStatus>,
+    mut movement_state: ResMut<crate::controls::MovementState>,
+    mut player_query: Query<&mut Transform, With<RotatingCube>>,
+    level_entities: Query<Entity, With<LevelGeometry>>,
+) {
+    let Some(request) = requests.read().last().cloned() else {
+        return;
+    };
+
+    for entity in &level_entities {
+        commands.entity(entity).despawn();
+    }
+
+    ergo.movement.plane_limit = crate::config::HumanErgoConfig::default().movement.plane_limit;
+    let load_result = crate::doom_wad::try_spawn_level_from_selection(
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+        &request.wad_path,
+        &request.map_name,
+    );
+
+    if let Ok(loaded) = load_result {
+        let level_spawn_info = loaded.info;
+        ergo.movement.plane_limit = ergo
+            .movement
+            .plane_limit
+            .max(level_spawn_info.suggested_plane_limit);
+
+        level_status.text = format!(
+            "Loaded {} (requested {}, using {} from {})",
+            request.wad_path, request.map_name, loaded.map_name, loaded.source_label
+        );
+
+        if let Ok(mut player_transform) = player_query.single_mut() {
+            *player_transform = Transform::from_translation(level_spawn_info.player_spawn)
+                .with_rotation(Quat::from_rotation_y(level_spawn_info.player_yaw));
+        }
+    } else {
+        let error = load_result
+            .err()
+            .unwrap_or_else(|| "unknown load error".to_string());
+        level_status.text = format!(
+            "Failed to load {} ({}) - {}",
+            request.wad_path, request.map_name, error
+        );
+        spawn_default_floor(&mut commands, &mut images, &mut meshes, &mut materials);
+    }
+
+    movement_state.vertical_velocity = 0.0;
+}
+
+pub fn update_collision_debug_visibility(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    menu_state: Option<Res<crate::ui::EscapeMenuState>>,
+    mut debug_state: ResMut<CollisionDebugState>,
+    mut visuals: Query<&mut Visibility, With<CollisionDebugVisual>>,
+) {
+    if let Some(menu_state) = menu_state && menu_state.is_open {
+        return;
+    }
+
+    if keyboard.just_pressed(KeyCode::F10) {
+        debug_state.visible = !debug_state.visible;
+    }
+
+    let target_visibility = if debug_state.visible {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
+
+    for mut visibility in &mut visuals {
+        *visibility = target_visibility;
+    }
 }
 
 pub fn update_camera_aim_cone(

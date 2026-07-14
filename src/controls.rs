@@ -2,6 +2,11 @@ use bevy::input::{mouse::AccumulatedMouseMotion, ButtonInput};
 use bevy::prelude::*;
 
 
+#[derive(Resource, Debug, Default, Clone, Copy)]
+pub struct NoclipState {
+    pub enabled: bool,
+}
+
 
 #[derive(Resource, Debug, Default, Clone, Copy)]
 pub struct MovementState {
@@ -38,6 +43,26 @@ pub fn tick_movement_freeze(time: Res<Time>, mut freeze: ResMut<MovementFreeze>)
         if timer.is_finished() {
             freeze.timer = None;
         }
+    }
+}
+
+pub fn toggle_noclip(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    menu_state: Option<Res<crate::ui::EscapeMenuState>>,
+    mut noclip: ResMut<NoclipState>,
+    mut movement_state: ResMut<MovementState>,
+) {
+    if let Some(menu_state) = menu_state && menu_state.is_open {
+        return;
+    }
+
+    if keyboard.just_pressed(KeyCode::F11) {
+        noclip.enabled = !noclip.enabled;
+        movement_state.vertical_velocity = 0.0;
+        println!(
+            "[controls] noclip {}",
+            if noclip.enabled { "enabled" } else { "disabled" }
+        );
     }
 }
 
@@ -183,8 +208,10 @@ pub fn move_cube(
     ergo: Res<crate::config::HumanErgoConfig>,
     menu_state: Option<Res<crate::ui::EscapeMenuState>>,
     mut movement_state: ResMut<MovementState>,
+    noclip: Res<NoclipState>,
     mut input_intent: ResMut<PlayerInputIntent>,
     freeze: Res<MovementFreeze>,
+    wad_collision: Option<Res<crate::doom_wad::WadCollisionWorld>>,
     camera_rig: Query<&CameraOrbitRig>,
     mut query: Query<&mut Transform, With<crate::RotatingCube>>,
 ) {
@@ -192,7 +219,7 @@ pub fn move_cube(
         return;
     }
 
-    let frozen = freeze.active();
+    let frozen = freeze.active() && !noclip.enabled;
 
     let mut direction = Vec2::ZERO;
     if !frozen {
@@ -210,19 +237,57 @@ pub fn move_cube(
         }
     }
 
-    let horizontal_movement = if direction == Vec2::ZERO {
-        Vec3::ZERO
-    } else {
-        let yaw = camera_rig
-            .single()
-            .map(|rig| rig.yaw)
-            .unwrap_or_default();
+    let (horizontal_movement, noclip_movement) = {
+        let rig = camera_rig.single().ok();
+        let yaw = rig.map(|value| value.yaw).unwrap_or_default();
+        let pitch = rig.map(|value| value.pitch).unwrap_or_default();
+
         let facing = Quat::from_rotation_y(yaw);
-        let forward = facing * -Vec3::Z;
-        let right = facing * Vec3::X;
-        ((right * direction.x) + (forward * direction.y)).normalize()
-            * ergo.movement.move_speed
-            * time.delta_secs()
+        let forward_flat = facing * -Vec3::Z;
+        let right_flat = facing * Vec3::X;
+
+        let horizontal = if direction == Vec2::ZERO {
+            Vec3::ZERO
+        } else {
+            ((right_flat * direction.x) + (forward_flat * direction.y)).normalize()
+                * ergo.movement.move_speed
+                * time.delta_secs()
+        };
+
+        let noclip_delta = if noclip.enabled {
+            let mut fly_direction = Vec3::ZERO;
+            if !frozen {
+                let look = Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0) * -Vec3::Z;
+                if keyboard.pressed(bindings.move_forward) {
+                    fly_direction += look;
+                }
+                if keyboard.pressed(bindings.move_backward) {
+                    fly_direction -= look;
+                }
+                if keyboard.pressed(bindings.move_left) {
+                    fly_direction -= right_flat;
+                }
+                if keyboard.pressed(bindings.move_right) {
+                    fly_direction += right_flat;
+                }
+                if keyboard.pressed(bindings.jump) {
+                    fly_direction += Vec3::Y;
+                }
+                if keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight) {
+                    fly_direction -= Vec3::Y;
+                }
+            }
+
+            if fly_direction.length_squared() > 0.0 {
+                fly_direction.normalize() * ergo.movement.move_speed * time.delta_secs()
+            } else {
+                Vec3::ZERO
+            }
+        } else {
+            Vec3::ZERO
+        };
+
+        (horizontal, noclip_delta)
     };
 
     let normalized_world_input = if horizontal_movement == Vec3::ZERO {
@@ -236,30 +301,44 @@ pub fn move_cube(
     input_intent.jump = !frozen && keyboard.just_pressed(bindings.jump);
 
     for mut transform in &mut query {
-        if !frozen
-            && transform.translation.y <= crate::player::CUBE_REST_Y + 0.001
+        let player_scale = ergo.movement.player_scale.clamp(0.35, 3.0);
+        let rest_y = crate::player::CUBE_REST_Y * player_scale;
+        transform.scale = Vec3::splat(player_scale);
+
+        if !noclip.enabled
+            && !frozen
+            && transform.translation.y <= rest_y + 0.001
             && keyboard.just_pressed(bindings.jump)
         {
             movement_state.vertical_velocity = ergo.movement.jump_velocity;
         }
 
-        movement_state.vertical_velocity -= ergo.movement.gravity * time.delta_secs();
-
-        transform.translation += horizontal_movement;
-        transform.translation.y += movement_state.vertical_velocity * time.delta_secs();
-
-        transform.translation.x = transform
-            .translation
-            .x
-            .clamp(-ergo.movement.plane_limit, ergo.movement.plane_limit);
-        transform.translation.z = transform
-            .translation
-            .z
-            .clamp(-ergo.movement.plane_limit, ergo.movement.plane_limit);
-
-        if transform.translation.y <= crate::player::CUBE_REST_Y {
-            transform.translation.y = crate::player::CUBE_REST_Y;
+        if noclip.enabled {
             movement_state.vertical_velocity = 0.0;
+            transform.translation += noclip_movement;
+        } else {
+            movement_state.vertical_velocity -= ergo.movement.gravity * time.delta_secs();
+
+            transform.translation += horizontal_movement;
+            transform.translation.y += movement_state.vertical_velocity * time.delta_secs();
+
+            transform.translation.x = transform
+                .translation
+                .x
+                .clamp(-ergo.movement.plane_limit, ergo.movement.plane_limit);
+            transform.translation.z = transform
+                .translation
+                .z
+                .clamp(-ergo.movement.plane_limit, ergo.movement.plane_limit);
+
+            if let Some(wad_collision) = &wad_collision {
+                transform.translation = wad_collision.resolve_position(transform.translation);
+            }
+
+            if transform.translation.y <= rest_y {
+                transform.translation.y = rest_y;
+                movement_state.vertical_velocity = 0.0;
+            }
         }
     }
 }
@@ -306,5 +385,5 @@ pub fn follow_cube_camera(
         return;
     };
 
-    rig_transform.translation = cube_transform.translation + Vec3::Y * crate::player::CUBE_REST_Y;
+    rig_transform.translation = cube_transform.translation + Vec3::Y * (crate::player::CUBE_REST_Y * cube_transform.scale.y);
 }

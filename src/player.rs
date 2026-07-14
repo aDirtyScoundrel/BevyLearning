@@ -205,6 +205,7 @@ pub fn spawn_player_chicken(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
+    spawn_transform: Transform,
 ) {
     commands
         .spawn((
@@ -215,7 +216,7 @@ pub fn spawn_player_chicken(
                 perceptual_roughness: DEFAULT_CUBE_ROUGHNESS,
                 ..default()
             })),
-            Transform::from_xyz(0.0, CUBE_REST_Y, 0.0),
+            spawn_transform,
             GlobalTransform::default(),
             Visibility::default(),
             RotatingCube,

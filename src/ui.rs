@@ -6,6 +6,7 @@ use bevy::prelude::*;
 use bevy::text::{EditableText, EditableTextFilter, TextCursorStyle};
 use bevy::ui_widgets::{observe, slider_self_update, Slider, SliderDragState, SliderRange, SliderThumb, SliderValue, TrackClick};
 use std::fs;
+use std::path::PathBuf;
 
 use crate::controls::{ControlAction, ControlBindings};
 use crate::RotatingCube;
@@ -58,6 +59,9 @@ pub struct SteamBrowserStatusText;
 pub struct SteamBrowserRowsText;
 
 #[derive(Component)]
+pub struct WadPickerText;
+
+#[derive(Component)]
 pub struct ErgoPanelRoot;
 
 #[derive(Component)]
@@ -90,6 +94,14 @@ pub struct ErgoSliderThumb;
 pub struct ErgoPanelState {
     status: String,
     is_visible: bool,
+}
+
+#[derive(Resource, Default)]
+pub struct WadPickerState {
+    pub is_open: bool,
+    pub files: Vec<String>,
+    pub selected_index: usize,
+    pub status: String,
 }
 
 #[derive(Clone, Copy)]
@@ -132,6 +144,7 @@ pub enum ErgoSetting {
     JumpVelocity,
     Gravity,
     PlaneLimit,
+    PlayerScale,
     CameraSensitivityX,
     CameraSensitivityY,
     CameraPitchLimit,
@@ -149,6 +162,7 @@ impl ErgoSetting {
             ErgoSetting::JumpVelocity => "Jump velocity",
             ErgoSetting::Gravity => "Gravity",
             ErgoSetting::PlaneLimit => "Plane limit",
+            ErgoSetting::PlayerScale => "Player scale",
             ErgoSetting::CameraSensitivityX => "Sensitivity X",
             ErgoSetting::CameraSensitivityY => "Sensitivity Y",
             ErgoSetting::CameraPitchLimit => "Pitch limit",
@@ -166,6 +180,7 @@ impl ErgoSetting {
             ErgoSetting::JumpVelocity => (1.0, 15.0),
             ErgoSetting::Gravity => (1.0, 30.0),
             ErgoSetting::PlaneLimit => (3.0, 50.0),
+            ErgoSetting::PlayerScale => (0.35, 3.0),
             ErgoSetting::CameraSensitivityX => (0.0005, 0.02),
             ErgoSetting::CameraSensitivityY => (0.0005, 0.02),
             ErgoSetting::CameraPitchLimit => (0.3, 1.55),
@@ -183,6 +198,7 @@ impl ErgoSetting {
             ErgoSetting::JumpVelocity => ergo.movement.jump_velocity,
             ErgoSetting::Gravity => ergo.movement.gravity,
             ErgoSetting::PlaneLimit => ergo.movement.plane_limit,
+            ErgoSetting::PlayerScale => ergo.movement.player_scale,
             ErgoSetting::CameraSensitivityX => ergo.camera.sensitivity_x,
             ErgoSetting::CameraSensitivityY => ergo.camera.sensitivity_y,
             ErgoSetting::CameraPitchLimit => ergo.camera.pitch_limit,
@@ -203,6 +219,7 @@ impl ErgoSetting {
             ErgoSetting::JumpVelocity => ergo.movement.jump_velocity = value,
             ErgoSetting::Gravity => ergo.movement.gravity = value,
             ErgoSetting::PlaneLimit => ergo.movement.plane_limit = value,
+            ErgoSetting::PlayerScale => ergo.movement.player_scale = value,
             ErgoSetting::CameraSensitivityX => ergo.camera.sensitivity_x = value,
             ErgoSetting::CameraSensitivityY => ergo.camera.sensitivity_y = value,
             ErgoSetting::CameraPitchLimit => ergo.camera.pitch_limit = value,
@@ -423,6 +440,39 @@ pub fn setup_hud(mut commands: Commands) {
                 ConnectedUsersStub,
             ));
         });
+}
+
+pub fn setup_wad_picker(mut commands: Commands) {
+    commands.insert_resource(WadPickerState {
+        is_open: false,
+        files: collect_wad_candidates(),
+        selected_index: 0,
+        status: "F9: open WAD picker".to_string(),
+    });
+
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(20.0),
+            bottom: Val::Px(20.0),
+            width: Val::Px(420.0),
+            max_width: Val::Percent(45.0),
+            padding: UiRect::all(Val::Px(10.0)),
+            border: UiRect::all(Val::Px(1.0)),
+            border_radius: BorderRadius::all(Val::Px(10.0)),
+            ..default()
+        },
+        BackgroundColor(Color::srgba(0.05, 0.08, 0.11, 0.84)),
+        BorderColor::all(Color::srgba(0.72, 0.84, 0.96, 0.24)),
+        children![
+            (
+                Text::new("F9: open WAD picker"),
+                TextFont::from_font_size(11.0),
+                TextColor(Color::srgba(0.84, 0.92, 0.98, 0.94)),
+                WadPickerText,
+            )
+        ],
+    ));
 }
 
 pub fn setup_escape_menu(mut commands: Commands, bindings: Res<ControlBindings>) {
@@ -693,6 +743,7 @@ pub fn setup_ergo_panel(
             panel.spawn(ergo_slider_row(ErgoSetting::JumpVelocity, ergo.movement.jump_velocity));
             panel.spawn(ergo_slider_row(ErgoSetting::Gravity, ergo.movement.gravity));
             panel.spawn(ergo_slider_row(ErgoSetting::PlaneLimit, ergo.movement.plane_limit));
+            panel.spawn(ergo_slider_row(ErgoSetting::PlayerScale, ergo.movement.player_scale));
 
             panel.spawn((
                 Text::new("Camera"),
@@ -985,6 +1036,167 @@ pub fn update_steam_server_browser_ui(
             browser.rows.join("\n")
         };
     }
+}
+
+pub fn update_wad_picker(
+    keyboard_input: Res<ButtonInput<KeyCode>>,
+    menu_state: Option<Res<EscapeMenuState>>,
+    mut picker: ResMut<WadPickerState>,
+    level_status: Option<Res<crate::scene::LevelLoadStatus>>,
+    collision_debug: Option<Res<crate::scene::CollisionDebugState>>,
+    noclip_state: Option<Res<crate::controls::NoclipState>>,
+    mut text_query: Query<&mut Text, With<WadPickerText>>,
+    mut reload_writer: MessageWriter<crate::scene::ReloadLevelRequest>,
+) {
+    if let Some(menu_state) = menu_state && menu_state.is_open {
+        if let Ok(mut text) = text_query.single_mut() {
+            text.0 = "WAD picker paused while escape menu is open".to_string();
+        }
+        return;
+    }
+
+    if keyboard_input.just_pressed(KeyCode::F9) {
+        picker.is_open = !picker.is_open;
+        picker.files = collect_wad_candidates();
+        if picker.selected_index >= picker.files.len() {
+            picker.selected_index = picker.files.len().saturating_sub(1);
+        }
+        picker.status = if picker.is_open {
+            "WAD picker open".to_string()
+        } else {
+            "WAD picker closed".to_string()
+        };
+    }
+
+    if picker.is_open && keyboard_input.just_pressed(KeyCode::KeyR) {
+        picker.files = collect_wad_candidates();
+        if picker.selected_index >= picker.files.len() {
+            picker.selected_index = picker.files.len().saturating_sub(1);
+        }
+        picker.status = format!("Refreshed list ({} found)", picker.files.len());
+    }
+
+    if picker.is_open && keyboard_input.just_pressed(KeyCode::ArrowUp) && !picker.files.is_empty() {
+        picker.selected_index = picker.selected_index.saturating_sub(1);
+    }
+
+    if picker.is_open && keyboard_input.just_pressed(KeyCode::ArrowDown) && !picker.files.is_empty() {
+        picker.selected_index = (picker.selected_index + 1).min(picker.files.len() - 1);
+    }
+
+    if picker.is_open && keyboard_input.just_pressed(KeyCode::Enter) {
+        if let Some(selected) = picker.files.get(picker.selected_index) {
+            let map_name = std::env::var("DOOM_MAP").unwrap_or_else(|_| "MAP01".to_string());
+            reload_writer.write(crate::scene::ReloadLevelRequest {
+                wad_path: selected.clone(),
+                map_name: map_name.clone(),
+            });
+            picker.status = format!("Loading {} ({})", selected, map_name);
+            picker.is_open = false;
+        } else {
+            picker.status = "No WAD selected".to_string();
+        }
+    }
+
+    if let Ok(mut text) = text_query.single_mut() {
+        text.0 = if picker.is_open {
+            if picker.files.is_empty() {
+                "WAD picker: no .wad files found in . or ./wads (R refresh)".to_string()
+            } else {
+                let selected = picker
+                    .files
+                    .get(picker.selected_index)
+                    .map_or("", String::as_str);
+                format!(
+                    "WAD picker [{} / {}]: {} | Up/Down select, Enter load, R refresh, F9 close",
+                    picker.selected_index + 1,
+                    picker.files.len(),
+                    selected
+                )
+            }
+        } else {
+            let collision_hint = if let Some(collision_debug) = collision_debug {
+                if collision_debug.visible {
+                    "collision wireframe ON"
+                } else {
+                    "collision wireframe OFF"
+                }
+            } else {
+                "collision wireframe unavailable"
+            };
+
+            let noclip_hint = if let Some(noclip_state) = noclip_state {
+                if noclip_state.enabled {
+                    "noclip ON"
+                } else {
+                    "noclip OFF"
+                }
+            } else {
+                "noclip unavailable"
+            };
+
+            if let Some(level_status) = level_status {
+                format!(
+                    "{} | {} | {} | {} | F9 picker, F10 collision wireframe, F11 noclip",
+                    picker.status, level_status.text, collision_hint, noclip_hint
+                )
+            } else {
+                format!(
+                    "{} | {} | {} | F9 picker, F10 collision wireframe, F11 noclip",
+                    picker.status, collision_hint, noclip_hint
+                )
+            }
+        };
+    }
+}
+
+fn collect_wad_candidates() -> Vec<String> {
+    let mut candidates = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let roots = [PathBuf::from("."), PathBuf::from("wads")];
+    let max_depth = 4usize;
+
+    for root in roots {
+        let mut stack = vec![(root, 0usize)];
+        while let Some((dir, depth)) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if depth < max_depth {
+                        stack.push((path, depth + 1));
+                    }
+                    continue;
+                }
+
+                let is_map_container = path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| {
+                        ext.eq_ignore_ascii_case("wad")
+                            || ext.eq_ignore_ascii_case("pk3")
+                            || ext.eq_ignore_ascii_case("zip")
+                    });
+
+                if is_map_container {
+                    let canonical = fs::canonicalize(&path)
+                        .unwrap_or(path.clone())
+                        .to_string_lossy()
+                        .to_string();
+                    if seen.insert(canonical) {
+                        candidates.push(path.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    candidates.sort();
+    candidates.dedup();
+    candidates
 }
 
 #[allow(clippy::type_complexity)]
@@ -1438,6 +1650,7 @@ fn save_ergo_preset(slot: ErgoPresetSlot, ergo: &crate::config::HumanErgoConfig)
     lines.push(format!("{slot_key}.jump_velocity={}", ergo.movement.jump_velocity));
     lines.push(format!("{slot_key}.gravity={}", ergo.movement.gravity));
     lines.push(format!("{slot_key}.plane_limit={}", ergo.movement.plane_limit));
+    lines.push(format!("{slot_key}.player_scale={}", ergo.movement.player_scale));
     lines.push(format!("{slot_key}.camera_sensitivity_x={}", ergo.camera.sensitivity_x));
     lines.push(format!("{slot_key}.camera_sensitivity_y={}", ergo.camera.sensitivity_y));
     lines.push(format!("{slot_key}.camera_pitch_limit={}", ergo.camera.pitch_limit));
@@ -1490,6 +1703,7 @@ fn load_ergo_preset(slot: ErgoPresetSlot) -> Result<crate::config::HumanErgoConf
             "jump_velocity" => loaded.movement.jump_velocity = value,
             "gravity" => loaded.movement.gravity = value,
             "plane_limit" => loaded.movement.plane_limit = value,
+            "player_scale" => loaded.movement.player_scale = value,
             "camera_sensitivity_x" => loaded.camera.sensitivity_x = value,
             "camera_sensitivity_y" => loaded.camera.sensitivity_y = value,
             "camera_pitch_limit" => loaded.camera.pitch_limit = value,

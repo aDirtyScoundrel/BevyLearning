@@ -15,6 +15,7 @@ pub struct MovementTuning {
     pub jump_velocity: f32,
     pub gravity: f32,
     pub plane_limit: f32,
+    pub player_scale: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +46,7 @@ impl Default for HumanErgoConfig {
                 jump_velocity: 5.5,
                 gravity: 9.81,
                 plane_limit: 9.5,
+                player_scale: 1.0,
             },
             camera: CameraTuning {
                 sensitivity_x: 0.003,

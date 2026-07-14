@@ -7,6 +7,7 @@ mod ui;
 mod skybox;
 mod steam_mp;
 mod player;
+mod doom_wad;
 mod sync_codec;
 mod remote_runtime;
 mod server_tick;
@@ -87,6 +88,10 @@ fn capture_app_exit(
 
 fn add_player_controller_systems(app: &mut App) {
     app.add_systems(
+        Update,
+        controls::toggle_noclip.before(controls::move_cube),
+    )
+    .add_systems(
         Update,
         (
             controls::mouse_look,
@@ -187,11 +192,15 @@ fn run_client() {
         .insert_resource(config::HumanErgoConfig::default())
         .insert_resource(controls::ControlBindings::default())
         .insert_resource(controls::MovementState::default())
+        .insert_resource(controls::NoclipState::default())
         .insert_resource(controls::PlayerInputIntent::default())
         .insert_resource(controls::MovementFreeze::default())
         .insert_resource(scene::ProjectileSequence::default())
+        .insert_resource(scene::CollisionDebugState::default())
+        .insert_resource(scene::LevelLoadStatus::default())
         .insert_resource(ExitRequested::default())
         .insert_resource(local_player_id)
+        .add_message::<scene::ReloadLevelRequest>()
         .add_systems(
             Startup,
             (
@@ -199,6 +208,7 @@ fn run_client() {
                 steam_mp::setup_steam_sync,
                 scene::setup,
                 ui::setup_hud,
+                ui::setup_wad_picker,
                 ui::setup_steam_server_browser,
                 ui::setup_escape_menu,
                 ui::setup_ergo_panel,
@@ -233,6 +243,10 @@ fn run_client() {
                 style_fps_overlay_shadow,
             ),
         )
+        .add_systems(Update, ui::update_wad_picker)
+        .add_systems(Update, scene::update_collision_debug_visibility)
+        .add_systems(Update, doom_wad::update_wad_doors)
+        .add_systems(Update, scene::handle_reload_level_requests)
         .add_systems(
             Update,
             (

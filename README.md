@@ -28,6 +28,9 @@ A 3D multiplayer game built with Rust and Bevy. You play as a chicken on a share
 # Default (LAN, no Steam)
 cargo run
 
+# Load a DOOM map container (WAD or PK3, defaults to MAP01)
+DOOM_WAD=/path/to/doom2.wad DOOM_MAP=MAP01 cargo run
+
 # Release build
 cargo run --release
 
@@ -46,6 +49,9 @@ cargo run --features steamworks
 | Shoot seed | Mouse button / configured key |
 | Toggle pause | `F` |
 | Toggle Mach menu (ergo/rebind) | `F8` |
+| Toggle WAD picker | `F9` |
+| Toggle collision wireframe | `F10` |
+| Toggle noclip | `F11` |
 | Reset vertical speed | `X` |
 | Reset horizontal speed | `R` |
 
@@ -100,13 +106,13 @@ STEAM_AUTH_HOST_ID=<host_steam64_id> STEAM_AUTH_SECRET=dev-auth-secret STEAM_REM
 ## Release Packaging
 
 ```bash
-./scripts/release.sh --version v0.2.0
+./scripts/release.sh --version v0.3.0
 ```
 
 Upload to GitHub Releases (requires `GITHUB_TOKEN`):
 
 ```bash
-GITHUB_TOKEN=<token> ./scripts/release.sh --version v0.2.0 --upload-release
+GITHUB_TOKEN=<token> ./scripts/release.sh --version v0.3.0 --upload-release
 ```
 
 ## Notes
@@ -116,11 +122,14 @@ GITHUB_TOKEN=<token> ./scripts/release.sh --version v0.2.0 --upload-release
 - Replace App ID `480` with your real Steam app ID before shipping.
 - If release creation fails with API errors, verify token permissions include repository write access (classic PAT: `repo`; fine-grained PAT: Contents `Read and write`).
 - After publishing, revoke/rotate temporary tokens used for release automation.
+- WAD/PK3 loading currently uses classic map lumps (`VERTEXES`, `LINEDEFS`, `SIDEDEFS`, `SECTORS`, optional `THINGS`) to build geometry.
+- PK3 support loads maps from embedded `.wad` entries and direct UDMF `TEXTMAP` entries.
+- Runtime map picker scans `./` and `./wads` for `.wad` and `.pk3` files; press `F9`, choose with `Up`/`Down`, `Enter` to load, `R` to refresh.
 
 Preview actions without making changes:
 
 ```bash
-./scripts/release.sh --version v0.2.0 --dry-run
+./scripts/release.sh --version v0.3.0 --dry-run
 ```
 
 ### Release Checklist
@@ -130,13 +139,13 @@ Preview actions without making changes:
 3. Ensure tag exists for release version:
 
 ```bash
-git tag --list v0.2.0
+git tag --list v0.3.0
 ```
 
 4. Run release script:
 
 ```bash
-./scripts/release.sh --version v0.2.0 --upload-release
+./scripts/release.sh --version v0.3.0 --upload-release
 ```
 
 5. Confirm on GitHub:
