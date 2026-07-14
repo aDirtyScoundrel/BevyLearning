@@ -476,6 +476,14 @@ mod imp {
         send_payload(steam, &payload);
     }
 
+    /// Auto-refresh the Steam server browser on startup so servers are visible immediately.
+    pub fn auto_refresh_browser_on_startup(mut steam: Option<ResMut<SteamSync>>) {
+        let Some(steam) = steam.as_deref_mut() else {
+            return;
+        };
+        request_browser_refresh(steam);
+    }
+
     pub fn apply_local_freeze(
         _local_player: Res<crate::multiplayer::LocalPlayerId>,
         mut freeze: ResMut<crate::controls::MovementFreeze>,
@@ -1502,6 +1510,7 @@ mod imp {
 
     pub fn setup_steam_sync(_commands: Commands) {}
     pub fn setup_steam_metrics_overlay(_commands: Commands) {}
+    pub fn auto_refresh_browser_on_startup(_steam: Option<ResMut<SteamSync>>) {}
     pub fn process_callbacks(_browser_view: Option<ResMut<SteamBrowserView>>) {}
     pub fn update_steam_metrics_overlay(_keyboard: Res<ButtonInput<KeyCode>>) {}
     pub fn update_server_browser_controls(_keyboard: Res<ButtonInput<KeyCode>>) {}

@@ -220,6 +220,11 @@ fn run_client() {
             ),
         )
         .add_systems(
+            Startup,
+            steam_mp::auto_refresh_browser_on_startup
+                .after(steam_mp::setup_steam_sync),
+        )
+        .add_systems(
             Update,
             (capture_app_exit, steam_mp::send_local_leave, multiplayer::send_local_leave).chain(),
         )
