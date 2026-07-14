@@ -486,12 +486,9 @@ mod imp {
     /// Auto-refresh the Steam server browser on startup so servers are visible immediately.
     /// Uses a resource flag to request refresh on first Update frame after setup.
     pub fn auto_refresh_browser_on_startup(
-        mut steam: Option<ResMut<SteamSync>>,
+        _steam: Option<ResMut<SteamSync>>,
         mut state: ResMut<BrowserRefreshState>,
     ) {
-        let Some(steam) = steam.as_deref_mut() else {
-            return;
-        };
         state.should_refresh_on_first_update = true;
     }
 
