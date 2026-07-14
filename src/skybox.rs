@@ -1,9 +1,12 @@
+//! Procedurally generated solid-colour cubemap used as a placeholder skybox.
+
 use bevy::asset::RenderAssetUsages;
 use bevy::math::UVec3;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureViewDescriptor, TextureViewDimension};
 
 const SKYBOX_SIZE: u32 = 128;
+// One solid colour per cubemap face in the order: +X, -X, +Y, -Y, +Z, -Z.
 const SKYBOX_FACE_COLORS: [Color; 6] = [
     Color::srgb(0.3, 0.6, 0.95),
     Color::srgb(0.95, 0.45, 0.25),

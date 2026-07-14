@@ -1,3 +1,5 @@
+//! FPS diagnostic text update system.
+
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::prelude::*;
 

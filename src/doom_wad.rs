@@ -116,6 +116,7 @@ pub struct WallCollisionSegment {
 #[derive(Debug, Clone, Copy)]
 pub struct WadDoor {
     pub entity: Entity,
+    pub debug_entity: Entity,
     pub start: Vec2,
     pub end: Vec2,
     pub bottom: f32,
@@ -133,7 +134,7 @@ pub struct WadCollisionWorld {
 
 impl WadCollisionWorld {
     pub fn resolve_position(&self, position: Vec3) -> Vec3 {
-        if self.segments.is_empty() {
+        if self.segments.is_empty() && self.doors.is_empty() {
             return position;
         }
 
@@ -211,11 +212,11 @@ pub fn spawn_level_from_env(
 pub fn update_wad_doors(
     time: Res<Time>,
     menu_state: Option<Res<crate::ui::EscapeMenuState>>,
+    collision_debug: Option<Res<crate::scene::CollisionDebugState>>,
     world: Option<ResMut<WadCollisionWorld>>,
-    mut queries: ParamSet<(
-        Query<&Transform, With<crate::RotatingCube>>,
-        Query<&mut Transform, Without<crate::RotatingCube>>,
-    )>,
+    player_query: Query<&Transform, With<crate::RotatingCube>>,
+    mut door_transforms: Query<&mut Transform, Without<crate::RotatingCube>>,
+    mut debug_visuals: Query<&mut Visibility, With<crate::scene::DoorCollisionDebugVisual>>,
 ) {
     if let Some(menu_state) = menu_state && menu_state.is_open {
         return;
@@ -229,7 +230,6 @@ pub fn update_wad_doors(
     }
 
     let player_pos = {
-        let player_query = queries.p0();
         let Ok(player_transform) = player_query.single() else {
             return;
         };
@@ -237,8 +237,8 @@ pub fn update_wad_doors(
     };
 
     let dt = time.delta_secs().clamp(0.0, 0.1);
+    let debug_visible = collision_debug.map(|state| state.visible).unwrap_or(false);
 
-    let mut transforms = queries.p1();
     world.doors.retain_mut(|door| {
         if door.closed_height <= WALL_MIN_HEIGHT {
             return false;
@@ -260,12 +260,20 @@ pub fn update_wad_doors(
         }
         door.open_amount = door.open_amount.clamp(0.0, 1.0);
 
-        if let Ok(mut transform) = transforms.get_mut(door.entity) {
+        if let Ok(mut transform) = door_transforms.get_mut(door.entity) {
             let scale_y = (1.0 - door.open_amount).max(MIN_DOOR_SCALE_Y);
             transform.scale.y = scale_y;
             transform.translation.y = door.bottom
                 + (door.closed_height * scale_y) * 0.5
                 + door.closed_height * door.open_amount;
+
+            if let Ok(mut visibility) = debug_visuals.get_mut(door.debug_entity) {
+                *visibility = if debug_visible && door.open_amount < DOOR_COLLISION_OPEN_THRESHOLD {
+                    Visibility::Visible
+                } else {
+                    Visibility::Hidden
+                };
+            }
             true
         } else {
             // Door entity was despawned by a level reload or cleanup, drop stale runtime state.
@@ -402,11 +410,13 @@ fn spawn_level_from_wad(
                     bottom,
                     door_height,
                 );
+                let debug_entity = spawn_collision_debug_segment(commands, meshes, materials, start, end, true);
 
                 let _door_tag = linedef.tag;
 
                 doors.push(WadDoor {
                     entity: door_entity,
+                    debug_entity,
                     start,
                     end,
                     bottom,
@@ -414,8 +424,6 @@ fn spawn_level_from_wad(
                     open_amount: 0.0,
                     hold_timer_secs: 0.0,
                 });
-                collision_segments.push(WallCollisionSegment { start, end });
-                spawn_collision_debug_segment(commands, meshes, materials, start, end);
                 continue;
             }
 
@@ -440,7 +448,7 @@ fn spawn_level_from_wad(
                     || (right_ceil - left_ceil).abs() > WALL_MIN_HEIGHT)
             {
                 collision_segments.push(WallCollisionSegment { start, end });
-                spawn_collision_debug_segment(commands, meshes, materials, start, end);
+                spawn_collision_debug_segment(commands, meshes, materials, start, end, false);
             }
         } else {
             let middle_texture = right_side
@@ -448,7 +456,7 @@ fn spawn_level_from_wad(
                 .unwrap_or("METAL".to_string());
             spawn_wall_band(commands, meshes, materials, start, end, right_floor, right_ceil, middle_texture);
             collision_segments.push(WallCollisionSegment { start, end });
-            spawn_collision_debug_segment(commands, meshes, materials, start, end);
+            spawn_collision_debug_segment(commands, meshes, materials, start, end, false);
         }
     }
 
@@ -1271,17 +1279,18 @@ fn spawn_collision_debug_segment(
     materials: &mut Assets<StandardMaterial>,
     start: Vec2,
     end: Vec2,
-) {
+    is_door: bool,
+) -> Entity {
     let segment = end - start;
     let length = segment.length();
     if length <= 0.001 {
-        return;
+        return Entity::PLACEHOLDER;
     }
 
     let midpoint = (start + end) * 0.5;
     let yaw = segment.x.atan2(segment.y);
 
-    commands.spawn((
+    let mut entity_commands = commands.spawn((
         Mesh3d(
             meshes.add(
                 Cuboid::new(COLLISION_DEBUG_THICKNESS, COLLISION_DEBUG_HEIGHT, length)
@@ -1302,6 +1311,12 @@ fn spawn_collision_debug_segment(
         crate::scene::LevelGeometry,
         crate::scene::CollisionDebugVisual,
     ));
+
+    if is_door {
+        entity_commands.insert(crate::scene::DoorCollisionDebugVisual);
+    }
+
+    entity_commands.id()
 }
 
 fn spawn_door_panel(

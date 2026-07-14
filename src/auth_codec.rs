@@ -1,12 +1,20 @@
+//! Wire-format codecs for the Steam-transport authentication and input protocol.
+//!
+//! Each function encodes or decodes a single packet type identified by a
+//! 1-byte discriminator that follows the shared magic/version header.
+//! All multi-byte integers are little-endian.
+
 use bevy::prelude::*;
 use learning::auth::{AuthProof, SessionToken};
 
+// Auth handshake sequence: hello → challenge → proof → accept
 pub const PACKET_AUTH_HELLO: u8 = 10;
 pub const PACKET_AUTH_CHALLENGE: u8 = 11;
 pub const PACKET_AUTH_PROOF: u8 = 12;
 pub const PACKET_AUTH_ACCEPT: u8 = 13;
-pub const PACKET_INPUT: u8 = 14;
-pub const PACKET_SNAPSHOT: u8 = 15;
+// Ongoing game traffic once a session is established
+pub const PACKET_INPUT: u8 = 14;     // client → host: movement axes + color
+pub const PACKET_SNAPSHOT: u8 = 15; // host → clients: authoritative state for all players
 
 pub fn encode_auth_hello(magic: [u8; 4], version: u8, player_id: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(14);
@@ -164,7 +172,7 @@ pub fn encode_snapshot_packet(magic: [u8; 4], version: u8, states: &[(u64, Trans
             (srgba.green.clamp(0.0, 1.0) * 255.0) as u8,
             (srgba.blue.clamp(0.0, 1.0) * 255.0) as u8,
         ]);
-        out.push(0);
+        out.push(0); // 1-byte alignment pad to keep each record at 24 bytes
     }
 
     out

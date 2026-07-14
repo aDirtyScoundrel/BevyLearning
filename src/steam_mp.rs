@@ -16,16 +16,24 @@ mod imp {
     use std::collections::{HashMap, HashSet};
     use std::time::{Duration, Instant};
 
+    // Packet framing: every packet starts with a 4-byte magic tag and a 1-byte version.
     const STEAM_SYNC_MAGIC: [u8; 4] = *b"STMC";
     const STEAM_SYNC_VERSION: u8 = 1;
-    const PACKET_STATE: u8 = 1;
-    const PACKET_JOIN: u8 = 2;
-    const PACKET_LEAVE: u8 = 3;
-    const PACKET_FREEZE: u8 = 4;
-    const PACKET_PROJECTILE: u8 = 5;
+
+    // Packet type discriminators used in the second header byte.
+    const PACKET_STATE: u8 = 1;       // periodic position/color update
+    const PACKET_JOIN: u8 = 2;        // initial announce on connection
+    const PACKET_LEAVE: u8 = 3;       // graceful disconnect notice
+    const PACKET_FREEZE: u8 = 4;      // freeze a target player briefly
+    const PACKET_PROJECTILE: u8 = 5;  // replicate a projectile spawn
+
+    // Tick rate for outbound state packets (~20 Hz).
     const SEND_INTERVAL: Duration = Duration::from_millis(50);
+    // Drop a remote peer's state after this much silence.
     const REMOTE_TIMEOUT: Duration = Duration::from_secs(5);
+    // How long to remember projectile IDs for deduplication.
     const PROJECTILE_DEDUP_TTL: Duration = Duration::from_secs(15);
+
     const FREEZE_DURATION_SECS: f32 = 2.0;
     const METRICS_OVERLAY_TOGGLE_KEY: KeyCode = KeyCode::F5;
 
@@ -109,37 +117,75 @@ mod imp {
 
     #[derive(Resource)]
     pub struct SteamSync {
+        // ── Core client ──────────────────────────────────────────────────────────
         pub client: steamworks::Client,
+
+        // ── Network topology ─────────────────────────────────────────────────────
+        /// Peers we broadcast/send state to. Updated from the joined lobby each tick.
         pub targets: Vec<steamworks::SteamId>,
+        /// The authoritative host we send input to (UntrustedClient role only).
         auth_host: Option<steamworks::SteamId>,
         pub last_send: Instant,
         presence_state: PresenceState,
         role: RuntimeSteamRole,
+
+        // ── Auth – shared ─────────────────────────────────────────────────────────
+        /// HMAC secret shared out-of-band; read from `STEAM_AUTH_SECRET` env var.
         auth_secret: String,
+
+        // ── Auth – client side ───────────────────────────────────────────────────
         client_auth_state: SteamClientAuthState,
+        /// Minted by the host after a successful proof exchange; carried in every input packet.
         client_session_token: Option<learning::auth::SessionToken>,
+        /// Monotonically increasing counter used to reject replayed input packets.
         client_input_sequence: u32,
+
+        // ── Auth – host side ─────────────────────────────────────────────────────
+        /// Per-peer auth handshake state (challenge nonce, player id, minted token).
         auth_sessions: HashMap<steamworks::SteamId, SteamAuthSession>,
+        /// Reverse map from session token → player Steam64 ID.
         token_to_player: HashMap<learning::auth::SessionToken, u64>,
+        /// Locks a player's ingress to the first peer that sent a valid token.
         player_ingress_peer: HashMap<u64, steamworks::SteamId>,
+        /// Last accepted input sequence per player; used to drop replays.
         last_input_sequence_by_player: HashMap<u64, u32>,
+
+        // ── Diagnostics ──────────────────────────────────────────────────────────
         metrics: SteamNetMetrics,
         last_metrics_log: Instant,
+
+        // ── Authoritative sim (host only) ────────────────────────────────────────
+        /// Latest validated input sample per remote player.
         authoritative_inputs: HashMap<u64, SteamInputSample>,
+        /// Vertical velocity for each remote player's simulated cube.
         authoritative_vertical_velocity: HashMap<u64, f32>,
+
+        // ── Client reconciliation ────────────────────────────────────────────────
+        /// Authoritative transform snapshot pushed by the host; lerped to each frame.
         pending_local_reconciliation: Option<Transform>,
+
+        // ── Lobby / server browser ───────────────────────────────────────────────
         hosted_lobby: Option<steamworks::LobbyId>,
         joined_lobby: Option<steamworks::LobbyId>,
         browser_entries: Vec<BrowserEntry>,
         browser_selected: usize,
         browser_status: String,
+        /// Channel for lobby list / join results from background Steamworks callbacks.
         browser_mailbox: Arc<Mutex<Vec<BrowserMessage>>>,
         browser_refresh_in_flight: bool,
+
+        // ── Remote entity state ───────────────────────────────────────────────────
+        /// Latest known position/color per remote Steam64 ID.
         remote_states: HashMap<u64, RemoteState>,
+        /// Bevy entity spawned for each remote player.
         spawned_entities: HashMap<u64, Entity>,
+        /// Players that sent a LEAVE packet; cleaned up on the next sync pass.
         departed_players: HashSet<u64>,
+        /// Freeze targets queued from incoming packets; drained each frame.
         pending_freezes: Vec<u64>,
+        /// Projectile spawns queued from incoming packets; drained each frame.
         pending_projectiles: Vec<crate::scene::ProjectileSpawnData>,
+        /// Recently seen (player_id, projectile_id) pairs used for deduplication.
         seen_projectiles: HashMap<(u64, u32), Instant>,
     }
 
@@ -177,6 +223,7 @@ mod imp {
     #[derive(Component)]
     pub struct SteamMetricsOverlayText;
 
+    /// Broadcast `payload` to all current targets using unreliable send.
     fn send_payload(steam: &SteamSync, payload: &[u8]) {
         if steam.targets.is_empty() {
             return;
@@ -193,6 +240,11 @@ mod imp {
         }
     }
 
+    /// Route a raw inbound P2P packet to the appropriate role-specific handler.
+    ///
+    /// AuthHost and UntrustedClient have dedicated paths that handle the
+    /// challenge/proof/token handshake and authoritative inputs.  LegacyPeer
+    /// falls through to direct state/projectile/freeze decoding.
     fn process_incoming_packet(
         steam: &mut SteamSync,
         remote: steamworks::SteamId,
@@ -208,6 +260,7 @@ mod imp {
                 process_client_packet(steam, remote, local_id, data);
                 return;
             }
+            // LegacyPeer: fall through to direct packet decoding below.
             RuntimeSteamRole::LegacyPeer => {}
         }
 
@@ -257,6 +310,14 @@ mod imp {
         }
     }
 
+    /// Initialise the Steamworks client and insert [`SteamSync`] as a Bevy resource.
+    ///
+    /// Role is determined at startup from environment variables:
+    /// - `STEAM_AUTH_HOST=1`      → AuthHost (runs the authoritative sim)
+    /// - `STEAM_AUTH_HOST_ID=<id>`→ UntrustedClient (sends inputs, trusts snapshots)
+    /// - neither                  → LegacyPeer (direct transform broadcast, no auth)
+    ///
+    /// Does nothing if the Steam API fails to initialise.
     pub fn setup_steam_sync(mut commands: Commands) {
         let role = if std::env::var("STEAM_AUTH_HOST")
             .ok()
@@ -667,7 +728,9 @@ mod imp {
                         let _ = mm.set_lobby_data(lobby, "game", "learning");
                         let _ = mm.set_lobby_joinable(lobby, true);
                     }
-                    Err(_err) => {}
+                    Err(_err) => {
+                        eprintln!("[steam-mp] failed to create host lobby: {_err:?}");
+                    }
                 },
             }
         }
@@ -781,8 +844,8 @@ mod imp {
 
         while let Some(size) = networking.is_p2p_packet_available() {
             let mut buf = vec![0u8; size];
-            if let Some((_remote, packet_size)) = networking.read_p2p_packet(&mut buf) {
-                process_incoming_packet(steam, _remote, local_id, &buf[..packet_size]);
+            if let Some((remote, packet_size)) = networking.read_p2p_packet(&mut buf) {
+                process_incoming_packet(steam, remote, local_id, &buf[..packet_size]);
             } else {
                 break;
             }
@@ -866,8 +929,7 @@ mod imp {
 
         for (player_id, state) in &steam.remote_states {
             if let Some(entity) = steam.spawned_entities.get(player_id).copied() {
-                if let Ok((_entity, mut transform, remote, material_handle)) = cube_query.get_mut(entity) {
-                    let _ = remote.player_id;
+                if let Ok((_entity, mut transform, _remote, material_handle)) = cube_query.get_mut(entity) {
                     *transform = state.transform;
 
                     if let Some(mut material) = materials.get_mut(&material_handle.0) {
@@ -904,6 +966,8 @@ mod imp {
             }
         }
 
+        // Despawn entities whose remote_state was pruned (timeout or departure)
+        // but whose Bevy entity wasn't yet removed.
         let active_ids: std::collections::HashSet<u64> = steam.remote_states.keys().copied().collect();
         let stale_ids: Vec<u64> = steam
             .spawned_entities
@@ -1225,6 +1289,12 @@ mod imp {
         )
     }
 
+    /// Advance the authoritative physics simulation for every remote player by `dt` seconds.
+    ///
+    /// Reads the latest validated [`SteamInputSample`] per player and applies
+    /// movement, gravity, jumping, and world-boundary clamping. Results are
+    /// written back into `remote_states` so `host_broadcast_snapshot` can
+    /// distribute them to connected clients.
     fn host_step_authoritative_sim(
         steam: &mut SteamSync,
         ergo: &crate::config::HumanErgoConfig,
@@ -1335,6 +1405,8 @@ mod imp {
         let _ = networking.send_p2p_packet(target, send_type, payload);
     }
 
+    /// Generate a unique challenge nonce from the current wall-clock nanoseconds.
+    /// Used when a peer sends a hello with no existing auth session.
     fn fresh_nonce() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

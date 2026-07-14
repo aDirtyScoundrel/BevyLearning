@@ -1,3 +1,5 @@
+//! Entry point and Bevy App setup.
+
 mod controls;
 mod config;
 mod auth_codec;
@@ -21,10 +23,12 @@ use bevy::window::{PresentMode, Window, WindowPlugin};
 use std::time::Duration;
 use std::fs;
 
+/// Marker component for the local player's chicken entity.
 #[derive(Component)]
 struct RotatingCube;
 
-
+/// Set to `true` when the app receives an [`AppExit`] event so the network
+/// layer can send a leave packet before the process exits.
 #[derive(Resource, Default)]
 struct ExitRequested(bool);
 

@@ -1,3 +1,5 @@
+//! Chicken player model: components, geometry constants, and mesh assembly.
+
 use bevy::math::primitives::{Cone, Cuboid, Cylinder, Sphere};
 use bevy::mesh::Mesh3d;
 use bevy::pbr::{MeshMaterial3d, StandardMaterial};
@@ -11,13 +13,17 @@ pub struct ChickenHead;
 
 #[derive(Component)]
 pub struct HeadTurnDelayTimer {
+    /// Seconds elapsed since the head started tracking the movement direction.
     pub elapsed: f32,
+    /// How long to wait before snapping the head to face the movement direction.
     pub delay_secs: f32,
 }
 
 #[derive(Component)]
 pub struct Wings {
+    /// Seconds into the current flap animation; reset to 0 when a new flap starts.
     pub flap_timer: f32,
+    /// Whether a flap animation is currently playing.
     pub is_flapping: bool,
 }
 
@@ -29,7 +35,9 @@ pub struct Beak;
 
 #[derive(Component)]
 pub struct ChickenLeg {
+    /// Phase offset (radians) so the two legs swing 180° out of step with each other.
     pub phase_offset: f32,
+    /// World-space Y coordinate the leg returns to when not in the lift phase.
     pub base_y: f32,
 }
 

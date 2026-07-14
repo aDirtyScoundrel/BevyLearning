@@ -1,3 +1,5 @@
+//! World setup, level loading, projectile management, and the local player spawn.
+
 use bevy::asset::RenderAssetUsages;
 use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::light::Skybox;
@@ -26,6 +28,9 @@ pub struct LevelGeometry;
 #[derive(Component)]
 pub struct CollisionDebugVisual;
 
+#[derive(Component)]
+pub struct DoorCollisionDebugVisual;
+
 #[derive(Resource, Debug, Clone, Copy)]
 pub struct CollisionDebugState {
     pub visible: bool,
@@ -48,18 +53,26 @@ pub struct LevelLoadStatus {
     pub text: String,
 }
 
+// Floor geometry dimensions and texture parameters.
 const FLOOR_HALF_EXTENT: f32 = 12.0;
 const FLOOR_TEXTURE_SIZE: u32 = 512;
+/// How many times the floor texture tiles across the full floor width.
 const FLOOR_TEXTURE_REPEAT: f32 = 10.0;
+
+// Aim-cone visual that floats above the player to show fire direction.
 const AIM_CONE_RADIUS: f32 = 0.24;
 const AIM_CONE_HEIGHT: f32 = 1.0;
 const AIM_CONE_OFFSET_Y: f32 = 1.8;
+
+// Seed projectile physics.
 const SEED_PROJECTILE_SPEED: f32 = 42.0;
 const SEED_PROJECTILE_LIFETIME_SECS: f32 = 1.0;
 const SEED_WIDTH: f32 = 0.06;
 const SEED_LENGTH: f32 = 0.12;
+/// Squared hit radius used for projectile → remote-player collision tests.
 const PROJECTILE_HIT_RADIUS_SQ: f32 = 1.0;
 
+// Camera orbit parameters.
 const CAMERA_PIVOT_HEIGHT: f32 = 1.4;
 const CAMERA_DISTANCE: f32 = 5.5;
 const CAMERA_HEIGHT: f32 = 1.6;
@@ -398,7 +411,10 @@ pub fn update_collision_debug_visibility(
     keyboard: Res<ButtonInput<KeyCode>>,
     menu_state: Option<Res<crate::ui::EscapeMenuState>>,
     mut debug_state: ResMut<CollisionDebugState>,
-    mut visuals: Query<&mut Visibility, With<CollisionDebugVisual>>,
+    mut visuals: Query<
+        &mut Visibility,
+        (With<CollisionDebugVisual>, Without<DoorCollisionDebugVisual>),
+    >,
 ) {
     if let Some(menu_state) = menu_state && menu_state.is_open {
         return;

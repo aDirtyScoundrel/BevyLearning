@@ -1,18 +1,23 @@
+//! Player input resources, camera orbit rig, key bindings, and movement freeze.
+
 use bevy::input::{mouse::AccumulatedMouseMotion, ButtonInput};
 use bevy::prelude::*;
 
 
+/// Toggles free-fly "noclip" movement that bypasses gravity and collision.
 #[derive(Resource, Debug, Default, Clone, Copy)]
 pub struct NoclipState {
     pub enabled: bool,
 }
 
-
+/// Persistent vertical velocity for the local player's physics integration.
 #[derive(Resource, Debug, Default, Clone, Copy)]
 pub struct MovementState {
     pub vertical_velocity: f32,
 }
 
+/// Normalised input intent sampled each frame; consumed by `move_cube` and
+/// forwarded to the network layer for auth-server input packets.
 #[derive(Resource, Debug, Default, Clone, Copy)]
 pub struct PlayerInputIntent {
     pub move_x: f32,
@@ -20,6 +25,8 @@ pub struct PlayerInputIntent {
     pub jump: bool,
 }
 
+/// Temporary lock that prevents the player from moving for a fixed duration.
+/// Activated remotely via a freeze packet; expires automatically each frame.
 #[derive(Resource, Debug, Default, Clone)]
 pub struct MovementFreeze {
     timer: Option<Timer>,
@@ -66,6 +73,7 @@ pub fn toggle_noclip(
     }
 }
 
+/// Third-person orbit camera angles attached to the camera entity.
 #[derive(Component, Debug, Clone, Copy)]
 pub struct CameraOrbitRig {
     pub yaw: f32,

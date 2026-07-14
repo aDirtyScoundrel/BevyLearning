@@ -1,8 +1,17 @@
+//! Shared helpers for managing remote-player entities spawned by both the LAN
+//! (`multiplayer`) and Steam P2P (`steam_mp`) transports.
+//!
+//! Both transports maintain the same state shape (`remote_states`,
+//! `spawned_entities`, etc.), so the common housekeeping is factored out here
+//! to avoid duplication.
+
 use bevy::pbr::StandardMaterial;
 use bevy::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+/// Spawn a visual entity for every pending projectile and tag it as
+/// [`ReplicatedProjectileVisual`] so it can be distinguished from locally-fired ones.
 pub fn drain_remote_projectiles(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -25,6 +34,7 @@ pub fn drain_remote_projectiles(
     }
 }
 
+/// Remove departed players from state maps and despawn their Bevy entities.
 pub fn apply_departures<T>(
     commands: &mut Commands,
     departed_players: &mut HashSet<u64>,
@@ -39,6 +49,7 @@ pub fn apply_departures<T>(
     }
 }
 
+/// Drop any remote state whose `last_seen` timestamp is older than `timeout`.
 pub fn prune_remote_states<T>(
     remote_states: &mut HashMap<u64, T>,
     now: Instant,
@@ -48,6 +59,7 @@ pub fn prune_remote_states<T>(
     remote_states.retain(|_, state| now.duration_since(last_seen(state)) <= timeout);
 }
 
+/// Expire old `(player_id, projectile_id)` deduplication entries.
 pub fn prune_seen_projectiles(
     seen_projectiles: &mut HashMap<(u64, u32), Instant>,
     now: Instant,
@@ -56,6 +68,7 @@ pub fn prune_seen_projectiles(
     seen_projectiles.retain(|_, seen_at| now.duration_since(*seen_at) <= ttl);
 }
 
+/// Fan-out a projectile spawn notification to both transport layers.
 pub fn broadcast_projectile_spawn(
     sender_id: u64,
     spawn: &crate::scene::ProjectileSpawnData,
@@ -71,6 +84,7 @@ pub fn broadcast_projectile_spawn(
     }
 }
 
+/// Fan-out a freeze-target notification to both transport layers.
 pub fn broadcast_freeze_target(
     sender_id: u64,
     target_id: u64,
@@ -86,6 +100,8 @@ pub fn broadcast_freeze_target(
     }
 }
 
+/// Return the player ID of the first remote cube within `hit_radius_sq` of
+/// `projectile_pos`, checking both the LAN and Steam remote-cube sets.
 pub fn find_remote_hit_target(
     projectile_pos: Vec3,
     hit_radius_sq: f32,

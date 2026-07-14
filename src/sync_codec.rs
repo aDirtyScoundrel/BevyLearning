@@ -1,7 +1,18 @@
+//! Binary codec for LAN and Steam P2P transport packets.
+//!
+//! Packets are framed with a 4-byte magic tag, a 1-byte version, and a 1-byte
+//! type discriminator.  All numeric fields are little-endian.
+//!
+//! The `leave_packet_type` parameter in the state encode/decode functions lets
+//! callers share this codec across transports that use different discriminator
+//! values: when `packet_type == leave_packet_type` the position/rotation/color
+//! body is omitted so the receiver can detect a departure without position data.
+
 use bevy::prelude::*;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+/// A projectile replication snapshot decoded from the wire.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ProjectileSyncData {
     pub projectile_id: u32,
@@ -10,10 +21,12 @@ pub struct ProjectileSyncData {
     pub lifetime_secs: f32,
 }
 
+/// Read 4 raw bytes as a little-endian f32; returns `None` on slice-length mismatch.
 fn read_f32(slice: &[u8]) -> Option<f32> {
     Some(f32::from_le_bytes(slice.try_into().ok()?))
 }
 
+/// Like [`read_f32`] but also rejects NaN and infinity.
 fn read_finite_f32(slice: &[u8]) -> Option<f32> {
     let value = read_f32(slice)?;
     value.is_finite().then_some(value)
@@ -229,6 +242,10 @@ pub fn decode_projectile_packet(
     ))
 }
 
+/// Insert `(player_id, projectile_id)` into `seen_projectiles` and return `true`
+/// if this is the first time the pair has been seen within `ttl`.
+///
+/// Stale entries older than `ttl` are pruned on every call.
 pub fn accept_recent_projectile(
     seen_projectiles: &mut HashMap<(u64, u32), Instant>,
     player_id: u64,

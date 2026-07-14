@@ -1,7 +1,17 @@
+//! Authoritative physics simulation step used by the LAN server role.
+//!
+//! The Steam P2P transport has its own copy of this logic in `steam_mp`; the
+//! two will be unified once the server crate moves to a shared sim module.
+
 use bevy::prelude::*;
 use std::collections::HashMap;
 use std::time::Instant;
 
+/// Advance the authoritative physics simulation for every remote player by `dt` seconds.
+///
+/// Reads the latest validated [`PlayerInputSample`] per player and applies
+/// movement, gravity, jumping, and world-boundary clamping.  Results are written
+/// back into `remote_states` so the server can distribute them to clients.
 pub fn step_authoritative_sim(
     remote_states: &mut HashMap<u64, crate::multiplayer::RemoteState>,
     authoritative_inputs: &HashMap<u64, crate::multiplayer::PlayerInputSample>,
