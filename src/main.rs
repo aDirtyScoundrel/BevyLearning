@@ -238,10 +238,16 @@ fn run_client() {
                 ui::update_player_name_stub,
                 ui::update_connected_users_stub,
                 ui::update_steam_server_browser_ui,
+                steam_mp::apply_initial_browser_refresh,
                 steam_mp::update_server_browser_controls,
                 steam_mp::process_callbacks,
                 steam_mp::announce_local_presence,
                 steam_mp::receive_remote_states,
+            ),
+        )
+        .add_systems(
+            Update,
+            (
                 steam_mp::sync_remote_cubes,
                 steam_mp::sync_remote_projectiles,
                 steam_mp::send_local_state,

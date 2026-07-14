@@ -212,6 +212,11 @@ mod imp {
         pub selected_index: Option<usize>,
     }
 
+    #[derive(Resource, Default)]
+    pub struct BrowserRefreshState {
+        pub should_refresh_on_first_update: bool,
+    }
+
     #[derive(Resource)]
     pub struct SteamMetricsOverlayState {
         pub visible: bool,
@@ -430,6 +435,8 @@ mod imp {
             rows: Vec::new(),
             selected_index: None,
         });
+
+        commands.insert_resource(BrowserRefreshState::default());
     }
 
     pub fn setup_steam_metrics_overlay(mut commands: Commands) {
@@ -477,7 +484,26 @@ mod imp {
     }
 
     /// Auto-refresh the Steam server browser on startup so servers are visible immediately.
-    pub fn auto_refresh_browser_on_startup(mut steam: Option<ResMut<SteamSync>>) {
+    /// Uses a resource flag to request refresh on first Update frame after setup.
+    pub fn auto_refresh_browser_on_startup(
+        mut steam: Option<ResMut<SteamSync>>,
+        mut state: ResMut<BrowserRefreshState>,
+    ) {
+        let Some(steam) = steam.as_deref_mut() else {
+            return;
+        };
+        state.should_refresh_on_first_update = true;
+    }
+
+    pub fn apply_initial_browser_refresh(
+        mut steam: Option<ResMut<SteamSync>>,
+        mut state: ResMut<BrowserRefreshState>,
+    ) {
+        if !state.should_refresh_on_first_update {
+            return;
+        }
+        state.should_refresh_on_first_update = false;
+        
         let Some(steam) = steam.as_deref_mut() else {
             return;
         };
@@ -1508,9 +1534,22 @@ mod imp {
         pub selected_index: Option<usize>,
     }
 
-    pub fn setup_steam_sync(_commands: Commands) {}
+    #[derive(Resource, Default)]
+    #[allow(dead_code)]
+    pub struct BrowserRefreshState {
+        pub should_refresh_on_first_update: bool,
+    }
+
+    pub fn setup_steam_sync(mut commands: Commands) {
+        commands.insert_resource(BrowserRefreshState::default());
+    }
     pub fn setup_steam_metrics_overlay(_commands: Commands) {}
-    pub fn auto_refresh_browser_on_startup(_steam: Option<ResMut<SteamSync>>) {}
+    pub fn auto_refresh_browser_on_startup(
+        _steam: Option<ResMut<SteamSync>>,
+        _state: ResMut<BrowserRefreshState>,
+    ) {
+    }
+    pub fn apply_initial_browser_refresh(_steam: Option<ResMut<SteamSync>>, _state: ResMut<BrowserRefreshState>) {}
     pub fn process_callbacks(_browser_view: Option<ResMut<SteamBrowserView>>) {}
     pub fn update_steam_metrics_overlay(_keyboard: Res<ButtonInput<KeyCode>>) {}
     pub fn update_server_browser_controls(_keyboard: Res<ButtonInput<KeyCode>>) {}
