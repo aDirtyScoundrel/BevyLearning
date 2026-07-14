@@ -308,7 +308,7 @@ pub fn animate_walk_cycle(
         walk_state.previous_horizontal = horizontal;
 
         let intensity = (speed / ergo.movement.move_speed).clamp(0.0, 1.0);
-        walk_state.phase += dt * ergo.walk_cycle.cycle_rate * intensity.max(0.1);
+        walk_state.phase += dt * ergo.walk_cycle.cycle_rate * intensity;
 
         for child in children.iter() {
             if let Ok((leg, mut leg_transform)) = leg_query.get_mut(child) {
