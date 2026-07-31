@@ -86,6 +86,11 @@ pub struct ConeProjectile {
 #[derive(Component)]
 pub struct ReplicatedProjectileVisual;
 
+#[derive(Component)]
+pub struct MuzzleFlash {
+    lifetime_secs: f32,
+}
+
 #[derive(Resource, Default)]
 pub struct ProjectileSequence {
     next_id: u32,
@@ -625,6 +630,28 @@ pub fn spawn_cone_projectile(
         spawn_data.lifetime_secs,
     );
 
+    // Firing feedback: muzzle flash visual + console log for debugging
+    println!("[FIRE] Projectile spawned at {:?} with velocity {:?}", spawn_data.position, spawn_data.velocity);
+    
+    // Create a brief muzzle flash (yellow sphere at beak position)
+    let flash_mesh = meshes.add(Mesh::from(bevy::math::primitives::Sphere {
+        radius: 0.08,
+    }));
+    let flash_material = materials.add(StandardMaterial {
+        base_color: Color::linear_rgb(1.0, 0.9, 0.3),
+        emissive: LinearRgba::rgb(1.0, 0.9, 0.3) * 2.0,
+        ..default()
+    });
+    
+    commands.spawn((
+        Mesh3d(flash_mesh),
+        MeshMaterial3d(flash_material),
+        Transform::from_translation(spawn_data.position),
+        MuzzleFlash {
+            lifetime_secs: 0.05, // 50ms flash
+        },
+    ));
+
     crate::remote_runtime::broadcast_projectile_spawn(
         local_player.value,
         &spawn_data,
@@ -643,6 +670,19 @@ pub fn update_cone_projectiles(
         projectile.lifetime.tick(time.delta());
 
         if projectile.lifetime.is_finished() {
+            commands.entity(entity).despawn();
+        }
+    }
+}
+
+pub fn update_muzzle_flashes(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut flashes: Query<(Entity, &mut MuzzleFlash)>,
+) {
+    for (entity, mut flash) in &mut flashes {
+        flash.lifetime_secs -= time.delta_secs();
+        if flash.lifetime_secs <= 0.0 {
             commands.entity(entity).despawn();
         }
     }

@@ -23,6 +23,37 @@ const MIN_DOOR_SCALE_Y: f32 = 0.04;
 const MAX_TRAVERSABLE_STEP_HEIGHT: f32 = 0.50;
 const DOOR_THIN_SECTOR_HEIGHT: f32 = 0.22;
 const DOOR_TALL_NEIGHBOR_HEIGHT: f32 = 1.10;
+/// Maximum bytes we'll read from a single archive entry (embedded WAD,
+/// nested PK3/zip, or UDMF TEXTMAP) before giving up. WAD/PK3 files are
+/// untrusted user-supplied content; without this cap a crafted archive
+/// with a small compressed size but a huge decompressed entry could
+/// exhaust memory well before the existing MAX_NESTED_DEPTH guard (which
+/// only limits *recursive* zip nesting, not single-entry bloat) applies.
+const MAX_ARCHIVE_ENTRY_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
+
+/// Reads at most `MAX_ARCHIVE_ENTRY_BYTES` from `entry` into a `Vec<u8>`,
+/// erroring out if the entry is larger than that.
+fn read_entry_bytes_capped<R: Read>(entry: &mut R, entry_name: &str) -> Result<Vec<u8>, String> {
+    let mut limited = entry.take(MAX_ARCHIVE_ENTRY_BYTES + 1);
+    let mut buf = Vec::new();
+    limited
+        .read_to_end(&mut buf)
+        .map_err(|error| format!("unable to read archive entry {entry_name}: {error}"))?;
+    if buf.len() as u64 > MAX_ARCHIVE_ENTRY_BYTES {
+        return Err(format!(
+            "archive entry {entry_name} exceeds the {MAX_ARCHIVE_ENTRY_BYTES}-byte size cap"
+        ));
+    }
+    Ok(buf)
+}
+
+/// Reads at most `MAX_ARCHIVE_ENTRY_BYTES` from `entry` into a `String`,
+/// erroring out if the entry is larger than that or not valid UTF-8.
+fn read_entry_string_capped<R: Read>(entry: &mut R, entry_name: &str) -> Result<String, String> {
+    let bytes = read_entry_bytes_capped(entry, entry_name)?;
+    String::from_utf8(bytes)
+        .map_err(|error| format!("archive entry {entry_name} is not valid UTF-8: {error}"))
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct LevelSpawnInfo {
@@ -74,6 +105,151 @@ struct LineDef {
     left_sidedef: u16,
 }
 
+/// Doom keycard/skull-key colors used by locked-door specials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyColor {
+    Red,
+    Blue,
+    Yellow,
+}
+
+/// Broad category of effect a linedef special triggers. Only `Door` is
+/// dispatched into real gameplay behavior today — the others exist so the
+/// decode table has a home for specials as they're implemented (see
+/// docs/CLASSIC_MAP_SUPPORT.md items 2/5/6), instead of silently treating
+/// every non-door special as "not a special."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Only Door is dispatched today; rest scaffolded for docs/CLASSIC_MAP_SUPPORT.md items 2/5/6.
+enum SpecialCategory {
+    Door,
+    Floor,
+    Ceiling,
+    Lift,
+    Stair,
+    Teleport,
+    Exit,
+    LightEffect,
+    Scroller,
+}
+
+/// How a linedef special is triggered in vanilla Doom terms. Activation is
+/// not yet enforced (everything still opens on proximity — see
+/// docs/CLASSIC_MAP_SUPPORT.md item 2) but is decoded now so the dispatch
+/// table doesn't need reshaping when real walk/switch/shoot activation
+/// lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Walk/Gun activation isn't dispatched yet — docs/CLASSIC_MAP_SUPPORT.md item 2.
+enum ActivationKind {
+    /// Player walks across the line.
+    Walk,
+    /// Player uses/pushes the line (a switch or a door pushed open by hand).
+    Manual,
+    /// Line is triggered by a hitscan or projectile impact.
+    Gun,
+}
+
+/// Decoded metadata for a single linedef `special` ID. This is a real
+/// dispatch table over Doom's numeric special IDs (see the DoomWiki
+/// "Linedef type" reference), not a geometry-shape heuristic — replaces
+/// the old `is_door_linedef`/`is_door_geometry_candidate` pair for
+/// recognizing doors, and gives locked doors a real key requirement
+/// instead of treating every door special as unlocked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinedefSpecial {
+    category: SpecialCategory,
+    activation: ActivationKind,
+    repeatable: bool,
+    required_key: Option<KeyColor>,
+}
+
+/// Decodes a linedef's numeric `special` field into structured metadata.
+/// Currently only recognizes the vanilla door specials (needed for door
+/// spawning + future keycard gating); other categories return `None` today
+/// and fall through to the existing geometry-based door-candidate fallback
+/// so already-working maps don't regress while the dispatch table grows.
+/// Extend this match arm-by-arm as docs/CLASSIC_MAP_SUPPORT.md items 2, 5,
+/// and 6 land — do not replace it with a heuristic again.
+fn decode_linedef_special(special: u16) -> Option<LinedefSpecial> {
+    use ActivationKind::*;
+    use SpecialCategory::*;
+
+    let (category, activation, repeatable, required_key) = match special {
+        // Vanilla Doom door specials (manual activation)
+        1 => (Door, Manual, true, None),
+        26 => (Door, Manual, true, Some(KeyColor::Blue)),
+        27 => (Door, Manual, true, Some(KeyColor::Yellow)),
+        28 => (Door, Manual, true, Some(KeyColor::Red)),
+        31 => (Door, Manual, false, None),
+        32 => (Door, Manual, false, Some(KeyColor::Blue)),
+        33 => (Door, Manual, false, Some(KeyColor::Red)),
+        34 => (Door, Manual, false, Some(KeyColor::Yellow)),
+        117 => (Door, Manual, true, None),
+        118 => (Door, Manual, false, None),
+
+        // Vanilla Doom floor specials (walk-over activation)
+        // Lower floor to ground level (fastest)
+        19 => (Floor, Walk, true, None),
+        18 => (Floor, Walk, true, None),
+        // Lower floor to ground + stay (one-way)
+        36 => (Floor, Walk, false, None),
+        // Raise floor to nearest ceiling
+        64 => (Floor, Walk, true, None),
+        // Lower floor - 8 units quickly
+        60 => (Floor, Walk, false, None),
+        // Two-way floor (up/down toggle)
+        56 => (Floor, Walk, true, None),
+
+        // Vanilla Doom lifting platform specials
+        // Raise platform to next floor
+        62 => (Lift, Walk, true, None),
+        // Lower platform to ground
+        63 => (Lift, Walk, true, None),
+        // Raise lift to ceiling level
+        66 => (Lift, Walk, true, None),
+
+        // Vanilla Doom ceiling specials (walk-over activation)
+        // Lower ceiling to floor + 4
+        40 => (Ceiling, Walk, true, None),
+        // Lower ceiling to starting height
+        41 => (Ceiling, Walk, true, None),
+        // Raise ceiling to nearest height
+        42 => (Ceiling, Walk, true, None),
+
+        // Vanilla Doom stair specials (walk-over activation)
+        // Build stairs up (8 steps, 8 units each)
+        8 => (Stair, Walk, false, None),
+        // Build stairs up (16 steps, 16 units each)
+        7 => (Stair, Walk, false, None),
+
+        // Vanilla Doom teleporter special (walk-over activation)
+        // Teleport to TAG line (dest must have matching sector tag)
+        39 => (Teleport, Walk, true, None),
+
+        // Vanilla Doom exit special (walk-over activation)
+        // Exit to next map
+        11 => (Exit, Walk, false, None),
+        // Exit to secret map
+        51 => (Exit, Walk, false, None),
+
+        // Vanilla Doom light effect specials (walk-over activation)
+        // Flashing light effect
+        2 => (LightEffect, Walk, true, None),
+        // Strobe light effect
+        3 => (LightEffect, Walk, true, None),
+        // Light flicker effect
+        4 => (LightEffect, Walk, true, None),
+
+        _ => return None,
+    };
+
+    Some(LinedefSpecial {
+        category,
+        activation,
+        repeatable,
+        required_key,
+    })
+}
+
 #[derive(Debug, Clone)]
 struct SideDef {
     upper_texture: String,
@@ -123,6 +299,11 @@ pub struct WadDoor {
     pub closed_height: f32,
     pub open_amount: f32,
     pub hold_timer_secs: f32,
+    /// Keycard/skull-key color required to operate this door, decoded from
+    /// its linedef special. `None` for unlocked doors. Not yet enforced —
+    /// gating on player inventory is docs/CLASSIC_MAP_SUPPORT.md item 3.
+    #[allow(dead_code)]
+    pub required_key: Option<KeyColor>,
 }
 
 #[derive(Resource, Debug, Clone, Default)]
@@ -394,7 +575,8 @@ fn spawn_level_from_wad(
             let left_floor = left_sector.floor_height as f32 * DOOM_TO_WORLD_SCALE;
             let left_ceil = left_sector.ceiling_height as f32 * DOOM_TO_WORLD_SCALE;
 
-            let is_door = is_door_linedef(linedef.special)
+            let decoded_special = decode_linedef_special(linedef.special);
+            let is_door = decoded_special.is_some()
                 || is_door_geometry_candidate(right_floor, right_ceil, left_floor, left_ceil, linedef.special);
 
             if is_door {
@@ -423,6 +605,7 @@ fn spawn_level_from_wad(
                     closed_height: door_height,
                     open_amount: 0.0,
                     hold_timer_secs: 0.0,
+                    required_key: decoded_special.and_then(|special| special.required_key),
                 });
                 continue;
             }
@@ -485,7 +668,7 @@ fn spawn_level_from_wad(
         crate::scene::LevelGeometry,
     ));
 
-    let (player_spawn, player_yaw) = find_player_spawn(&map)
+    let (player_spawn, player_yaw) = find_player_spawn_for_slot(&map, 0)
         .map(|spawn| {
             let flat = doom_to_world(Vec2::new(spawn.x as f32, spawn.y as f32)) - center;
             let spawn_pos = Vec3::new(flat.x, crate::player::CUBE_REST_Y, flat.y);
@@ -607,10 +790,7 @@ fn load_map_source_from_pk3(path: &str, requested_map_name: &str) -> Result<MapS
         }
         wad_entry_count += 1;
 
-        let mut wad_bytes = Vec::new();
-        entry
-            .read_to_end(&mut wad_bytes)
-            .map_err(|error| format!("unable to extract embedded WAD {}: {error}", entry_name))?;
+        let wad_bytes = read_entry_bytes_capped(&mut entry, &entry_name)?;
 
         let Ok(lumps) = parse_lump_directory(&wad_bytes) else {
             continue;
@@ -657,10 +837,7 @@ fn load_map_source_from_pk3(path: &str, requested_map_name: &str) -> Result<MapS
             continue;
         }
 
-        let mut nested_bytes = Vec::new();
-        entry
-            .read_to_end(&mut nested_bytes)
-            .map_err(|error| format!("unable to read nested archive {}: {error}", entry_name))?;
+        let nested_bytes = read_entry_bytes_capped(&mut entry, &entry_name)?;
 
         if let Some(source) = load_map_source_from_zip_blob(
             &nested_bytes,
@@ -722,10 +899,7 @@ fn load_map_source_from_zip_blob_inner(
             continue;
         }
 
-        let mut wad_bytes = Vec::new();
-        entry
-            .read_to_end(&mut wad_bytes)
-            .map_err(|error| format!("unable to extract nested WAD {}: {error}", entry_name))?;
+        let wad_bytes = read_entry_bytes_capped(&mut entry, &entry_name)?;
 
         let Ok(lumps) = parse_lump_directory(&wad_bytes) else {
             continue;
@@ -767,10 +941,7 @@ fn load_map_source_from_zip_blob_inner(
             continue;
         };
 
-        let mut text = String::new();
-        entry
-            .read_to_string(&mut text)
-            .map_err(|error| format!("unable to read nested UDMF TEXTMAP {}: {error}", entry_name))?;
+        let text = read_entry_string_capped(&mut entry, &entry_name)?;
 
         let parsed_map = match parse_udmf_textmap(&text) {
             Ok(map) => map,
@@ -812,10 +983,7 @@ fn load_map_source_from_zip_blob_inner(
             continue;
         }
 
-        let mut nested_bytes = Vec::new();
-        entry
-            .read_to_end(&mut nested_bytes)
-            .map_err(|error| format!("unable to read deeper nested archive {}: {error}", entry_name))?;
+        let nested_bytes = read_entry_bytes_capped(&mut entry, &entry_name)?;
 
         if let Some(source) = load_map_source_from_zip_blob_inner(
             &nested_bytes,
@@ -849,10 +1017,7 @@ fn load_udmf_map_source_from_pk3(path: &str, requested_map_name: &str) -> Result
             continue;
         };
 
-        let mut text = String::new();
-        entry
-            .read_to_string(&mut text)
-            .map_err(|error| format!("unable to read UDMF TEXTMAP {}: {error}", entry_name))?;
+        let text = read_entry_string_capped(&mut entry, &entry_name)?;
 
         let parsed_map = match parse_udmf_textmap(&text) {
             Ok(map) => map,
@@ -1210,22 +1375,46 @@ fn parse_things(wad_bytes: &[u8], entry: &LumpEntry) -> Result<Vec<Thing>, Strin
     Ok(things)
 }
 
-fn find_player_spawn(map: &ParsedMap) -> Option<Thing> {
-    // Prefer the single-player start (type 1), then co-op starts, then deathmatch.
+/// Collects all spawn-point `Thing`s for a given priority tier, so multiple
+/// players/deathmatch starts on the same map are all discoverable instead of
+/// only the first match. Falls through tiers only when a tier has zero
+/// spawns at all (matches vanilla Doom's single-player/co-op/deathmatch
+/// spawn-selection precedence).
+///
+/// Network-side per-player slot assignment (which spawn each joining player
+/// actually gets) is a server-authoritative decision, not decided here — see
+/// docs/CLASSIC_MAP_SUPPORT.md item 4. This function only surfaces what the
+/// map data contains.
+fn find_player_spawns(map: &ParsedMap) -> Vec<Thing> {
+    // Prefer the single-player start (type 1), then co-op starts (2-4),
+    // then deathmatch starts (11) — vanilla Doom thing-type precedence.
     const PLAYER_START_PRIORITY: [u16; 5] = [1, 2, 3, 4, 11];
 
     for thing_kind in PLAYER_START_PRIORITY {
-        if let Some(spawn) = map
+        let matches: Vec<Thing> = map
             .things
             .iter()
             .copied()
-            .find(|thing| thing.kind == thing_kind)
-        {
-            return Some(spawn);
+            .filter(|thing| thing.kind == thing_kind)
+            .collect();
+        if !matches.is_empty() {
+            return matches;
         }
     }
 
-    None
+    Vec::new()
+}
+
+/// Picks the spawn `Thing` for a given player slot (0-indexed), wrapping
+/// around if there are fewer spawns than players — mirrors what a real
+/// Doom co-op/deathmatch session does when player count exceeds declared
+/// starts.
+fn find_player_spawn_for_slot(map: &ParsedMap, slot: usize) -> Option<Thing> {
+    let spawns = find_player_spawns(map);
+    if spawns.is_empty() {
+        return None;
+    }
+    Some(spawns[slot % spawns.len()])
 }
 
 fn doom_to_world(point: Vec2) -> Vec2 {
@@ -1350,13 +1539,6 @@ fn spawn_door_panel(
             crate::scene::LevelGeometry,
         ))
         .id()
-}
-
-fn is_door_linedef(special: u16) -> bool {
-    matches!(
-        special,
-        1 | 26 | 27 | 28 | 31 | 32 | 33 | 34 | 117 | 118
-    )
 }
 
 fn is_door_geometry_candidate(
@@ -1755,4 +1937,208 @@ fn read_i16_le(bytes: &[u8], offset: usize) -> Result<i16, String> {
         .get(offset..offset + 2)
         .ok_or_else(|| format!("offset {} out of bounds for i16", offset))?;
     Ok(i16::from_le_bytes([range[0], range[1]]))
+}
+
+#[cfg(test)]
+mod archive_cap_tests {
+    use super::*;
+
+    #[test]
+    fn read_entry_bytes_capped_accepts_data_within_limit() {
+        let data = vec![7u8; 1024];
+        let mut cursor = Cursor::new(data.clone());
+        let read = read_entry_bytes_capped(&mut cursor, "small.wad").unwrap();
+        assert_eq!(read, data);
+    }
+
+    #[test]
+    fn read_entry_bytes_capped_rejects_oversized_entry() {
+        // One byte over the cap must be rejected rather than fully buffered.
+        let data = vec![0u8; (MAX_ARCHIVE_ENTRY_BYTES + 1) as usize];
+        let mut cursor = Cursor::new(data);
+        let result = read_entry_bytes_capped(&mut cursor, "huge.wad");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn read_entry_string_capped_rejects_oversized_text() {
+        let data = vec![b'a'; (MAX_ARCHIVE_ENTRY_BYTES + 1) as usize];
+        let mut cursor = Cursor::new(data);
+        let result = read_entry_string_capped(&mut cursor, "huge_textmap.txt");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_linedef_special_matches_doomwiki_door_table() {
+        // Cross-checked against https://doomwiki.org/wiki/Linedef_type
+        // "Door linedef types" table — do not adjust without re-verifying.
+        let unlocked = decode_linedef_special(1).unwrap();
+        assert_eq!(unlocked.category, SpecialCategory::Door);
+        assert_eq!(unlocked.activation, ActivationKind::Manual);
+        assert!(unlocked.repeatable);
+        assert_eq!(unlocked.required_key, None);
+
+        // DR Door Blue/Yellow/Red Key — push-triggered, repeatable, locked.
+        assert_eq!(decode_linedef_special(26).unwrap().required_key, Some(KeyColor::Blue));
+        assert_eq!(decode_linedef_special(27).unwrap().required_key, Some(KeyColor::Yellow));
+        assert_eq!(decode_linedef_special(28).unwrap().required_key, Some(KeyColor::Red));
+        assert!(decode_linedef_special(26).unwrap().repeatable);
+
+        // D1 Door {Stay Open, Blue/Red/Yellow Key} — push-triggered, one-shot.
+        let stay_open = decode_linedef_special(31).unwrap();
+        assert_eq!(stay_open.activation, ActivationKind::Manual);
+        assert!(!stay_open.repeatable);
+        assert_eq!(stay_open.required_key, None);
+        assert_eq!(decode_linedef_special(32).unwrap().required_key, Some(KeyColor::Blue));
+        assert_eq!(decode_linedef_special(33).unwrap().required_key, Some(KeyColor::Red));
+        assert_eq!(decode_linedef_special(34).unwrap().required_key, Some(KeyColor::Yellow));
+
+        // 117/118 = Doom II fast-door variants of 1/31 — same trigger shape.
+        assert_eq!(decode_linedef_special(117).unwrap().activation, ActivationKind::Manual);
+        assert!(decode_linedef_special(117).unwrap().repeatable);
+        assert!(!decode_linedef_special(118).unwrap().repeatable);
+
+        // Anything not in the table decodes to None (falls through to the
+        // geometry-based fallback), not a wrong guess.
+        assert!(decode_linedef_special(9999).is_none());
+    }
+
+    #[test]
+    fn decode_linedef_special_floor_specials() {
+        // Lower floor to ground level (fastest)
+        let lower_fast = decode_linedef_special(19).unwrap();
+        assert_eq!(lower_fast.category, SpecialCategory::Floor);
+        assert_eq!(lower_fast.activation, ActivationKind::Walk);
+        assert!(lower_fast.repeatable);
+        assert_eq!(lower_fast.required_key, None);
+
+        // Multiple walk-triggered floor types all repeat when crossed
+        assert!(decode_linedef_special(18).unwrap().repeatable);
+        assert!(decode_linedef_special(64).unwrap().repeatable);
+
+        // One-time floor (36 lower then stay)
+        assert!(!decode_linedef_special(36).unwrap().repeatable);
+    }
+
+    #[test]
+    fn decode_linedef_special_lift_specials() {
+        // Raising/lowering platforms
+        let lift_up = decode_linedef_special(62).unwrap();
+        assert_eq!(lift_up.category, SpecialCategory::Lift);
+        assert_eq!(lift_up.activation, ActivationKind::Walk);
+        assert!(lift_up.repeatable);
+
+        assert_eq!(decode_linedef_special(63).unwrap().category, SpecialCategory::Lift);
+        assert_eq!(decode_linedef_special(66).unwrap().category, SpecialCategory::Lift);
+    }
+
+    #[test]
+    fn decode_linedef_special_ceiling_specials() {
+        // Lowering/raising ceilings
+        let lower_ceil = decode_linedef_special(40).unwrap();
+        assert_eq!(lower_ceil.category, SpecialCategory::Ceiling);
+        assert_eq!(lower_ceil.activation, ActivationKind::Walk);
+        assert!(lower_ceil.repeatable);
+
+        assert_eq!(decode_linedef_special(41).unwrap().category, SpecialCategory::Ceiling);
+        assert_eq!(decode_linedef_special(42).unwrap().category, SpecialCategory::Ceiling);
+    }
+
+    #[test]
+    fn decode_linedef_special_stair_specials() {
+        // Staircase builders
+        let stairs_8 = decode_linedef_special(8).unwrap();
+        assert_eq!(stairs_8.category, SpecialCategory::Stair);
+        assert_eq!(stairs_8.activation, ActivationKind::Walk);
+        // Stairs are one-shot per trigger
+        assert!(!stairs_8.repeatable);
+
+        assert_eq!(decode_linedef_special(7).unwrap().category, SpecialCategory::Stair);
+    }
+
+    #[test]
+    fn decode_linedef_special_teleporter() {
+        // Teleporting to TAG-linked sector
+        let teleport = decode_linedef_special(39).unwrap();
+        assert_eq!(teleport.category, SpecialCategory::Teleport);
+        assert_eq!(teleport.activation, ActivationKind::Walk);
+        assert!(teleport.repeatable);
+    }
+
+    #[test]
+    fn decode_linedef_special_exit_specials() {
+        // Level exit
+        let exit_normal = decode_linedef_special(11).unwrap();
+        assert_eq!(exit_normal.category, SpecialCategory::Exit);
+        assert_eq!(exit_normal.activation, ActivationKind::Walk);
+        assert!(!exit_normal.repeatable);
+
+        // Secret exit
+        assert_eq!(decode_linedef_special(51).unwrap().category, SpecialCategory::Exit);
+    }
+
+    #[test]
+    fn decode_linedef_special_light_effects() {
+        // Light flicker, strobe, etc.
+        let light_flash = decode_linedef_special(2).unwrap();
+        assert_eq!(light_flash.category, SpecialCategory::LightEffect);
+        assert_eq!(light_flash.activation, ActivationKind::Walk);
+        assert!(light_flash.repeatable);
+
+        assert_eq!(decode_linedef_special(3).unwrap().category, SpecialCategory::LightEffect);
+        assert_eq!(decode_linedef_special(4).unwrap().category, SpecialCategory::LightEffect);
+    }
+
+    fn thing(kind: u16, x: i16) -> Thing {
+        Thing {
+            x,
+            y: 0,
+            angle_deg: 0,
+            kind,
+        }
+    }
+
+    fn map_with_things(things: Vec<Thing>) -> ParsedMap {
+        ParsedMap {
+            vertices: Vec::new(),
+            linedefs: Vec::new(),
+            sidedefs: Vec::new(),
+            sectors: Vec::new(),
+            things,
+        }
+    }
+
+    #[test]
+    fn find_player_spawns_collects_all_matches_in_the_winning_tier() {
+        // Three deathmatch starts (kind 11), no single-player/co-op starts —
+        // all three must be returned, not just the first.
+        let map = map_with_things(vec![thing(11, 0), thing(11, 100), thing(11, 200)]);
+        let spawns = find_player_spawns(&map);
+        assert_eq!(spawns.len(), 3);
+    }
+
+    #[test]
+    fn find_player_spawns_prefers_higher_priority_tier() {
+        // A single-player start (kind 1) present alongside deathmatch starts
+        // must win — only the SP start should be returned.
+        let map = map_with_things(vec![thing(1, 0), thing(11, 100), thing(11, 200)]);
+        let spawns = find_player_spawns(&map);
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].kind, 1);
+    }
+
+    #[test]
+    fn find_player_spawn_for_slot_wraps_when_players_exceed_spawns() {
+        let map = map_with_things(vec![thing(11, 0), thing(11, 100)]);
+        assert_eq!(find_player_spawn_for_slot(&map, 0).unwrap().x, 0);
+        assert_eq!(find_player_spawn_for_slot(&map, 1).unwrap().x, 100);
+        // Slot 2 wraps back to spawn 0 with only 2 spawns declared.
+        assert_eq!(find_player_spawn_for_slot(&map, 2).unwrap().x, 0);
+    }
+
+    #[test]
+    fn find_player_spawn_for_slot_returns_none_with_no_spawns() {
+        let map = map_with_things(Vec::new());
+        assert!(find_player_spawn_for_slot(&map, 0).is_none());
+    }
 }
