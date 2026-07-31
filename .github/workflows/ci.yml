@@ -1,0 +1,95 @@
+name: CI
+
+# Enforces the dual-feature-set rule from AGENTS.md. `steamworks` is a
+# default-on feature, and the #[cfg(not(feature = "steamworks"))] stub in
+# steam_mp.rs has to keep matching the real impl's public signatures --
+# that only breaks under --no-default-features, so every job runs both.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # -D warnings applies to rustc lints only (verified clean under both
+  # feature sets). Clippy lints are gated separately in the Clippy step --
+  # see the note there about type_complexity.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default (steamworks on)
+            flags: ""
+          - name: LAN-only
+            flags: "--no-default-features"
+    name: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the channel and components (rustfmt,
+      # clippy); the action reads it rather than duplicating the version.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.flags }}
+
+      # Bevy needs these to link on Linux even for `cargo check`.
+      # See bevy docs/linux_dependencies.md.
+      - name: Install Bevy system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
+
+      - name: Check
+        run: cargo check --all-targets ${{ matrix.flags }}
+
+      - name: Test
+        run: cargo test ${{ matrix.flags }}
+
+      # too_many_arguments is denied explicitly: the crate carries targeted
+      # #[allow]s on Bevy systems where the argument list IS the dependency
+      # injection, and this proves those allows still cover every site
+      # rather than the warning count merely drifting down.
+      #
+      # RUSTFLAGS is cleared for this step. The workflow-level
+      # `-D warnings` would also promote clippy's 5 remaining
+      # type_complexity warnings to errors; those sit on Bevy query
+      # signatures where introducing `type` aliases costs more readability
+      # than it buys, so they are deliberately not fixed and not gated.
+      - name: Clippy
+        env:
+          RUSTFLAGS: ""
+        run: cargo clippy --all-targets ${{ matrix.flags }} -- -D clippy::too_many_arguments
+
+  # rustfmt is intentionally NOT a blocking gate yet.
+  #
+  # `cargo fmt --all -- --check` currently reports a ~2873-line diff of
+  # PRE-EXISTING style debt across the crate (AGENTS.md calls this out:
+  # automated tooling here surfaces large rustfmt diffs on lines nobody
+  # touched). Turning that into a required check would make CI red on day
+  # one and train everyone to ignore it.
+  #
+  # To adopt it: run `cargo fmt --all` as a single isolated commit, confirm
+  # `cargo test` still passes both feature sets, then flip this job's
+  # `continue-on-error` off.
+  format:
+    name: rustfmt (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
