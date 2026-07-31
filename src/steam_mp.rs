@@ -42,12 +42,12 @@ mod imp {
         pub player_id: u64,
     }
 
-    #[derive(Debug, Clone)]
-    struct RemoteState {
-        transform: Transform,
-        color: Color,
-        last_seen: Instant,
-    }
+    // Unified with the LAN transport's type rather than redeclared. These
+    // were field-for-field identical, and the authoritative sim in
+    // server_tick operates on this type -- keeping two structurally
+    // identical definitions is what let the sim logic drift into two
+    // copies in the first place.
+    use crate::multiplayer::RemoteState;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum PresenceState {
@@ -62,13 +62,9 @@ mod imp {
         UntrustedClient,
     }
 
-    #[derive(Debug, Clone, Copy)]
-    struct SteamInputSample {
-        move_x: f32,
-        move_z: f32,
-        jump: bool,
-        color: Color,
-    }
+    // Unified with the LAN transport's input sample; the two were
+    // field-for-field identical and both feed the same authoritative sim.
+    use crate::multiplayer::PlayerInputSample as SteamInputSample;
 
     #[derive(Debug, Default, Clone, Copy)]
     struct SteamNetMetrics {
@@ -90,16 +86,8 @@ mod imp {
         host_payload_decode_rejects: u64,
     }
 
-    impl Default for SteamInputSample {
-        fn default() -> Self {
-            Self {
-                move_x: 0.0,
-                move_z: 0.0,
-                jump: false,
-                color: Color::srgb(0.96, 0.94, 0.88),
-            }
-        }
-    }
+    // Default for SteamInputSample now comes from multiplayer::PlayerInputSample
+    // (verified identical: same fields, same srgb(0.96, 0.94, 0.88) default).
 
     #[derive(Debug, Clone)]
     struct SteamAuthSession {
@@ -1342,49 +1330,19 @@ mod imp {
         ergo: &crate::config::HumanErgoConfig,
         dt: f32,
     ) {
-        if dt <= f32::EPSILON {
-            return;
-        }
-
-        for (player_id, input) in &steam.authoritative_inputs {
-            let vy = steam
-                .authoritative_vertical_velocity
-                .entry(*player_id)
-                .or_insert(0.0);
-            let state = steam.remote_states.entry(*player_id).or_insert(RemoteState {
-                transform: Transform::from_xyz(0.0, crate::player::CUBE_REST_Y, 0.0),
-                color: input.color,
-                last_seen: Instant::now(),
-            });
-
-            state.transform.translation.x += input.move_x.clamp(-1.0, 1.0) * ergo.movement.move_speed * dt;
-            state.transform.translation.z += input.move_z.clamp(-1.0, 1.0) * ergo.movement.move_speed * dt;
-
-            if input.jump && state.transform.translation.y <= crate::player::CUBE_REST_Y + 0.001 {
-                *vy = ergo.movement.jump_velocity;
-            }
-
-            *vy -= ergo.movement.gravity * dt;
-            state.transform.translation.y += *vy * dt;
-
-            if state.transform.translation.y <= crate::player::CUBE_REST_Y {
-                state.transform.translation.y = crate::player::CUBE_REST_Y;
-                *vy = 0.0;
-            }
-
-            state.transform.translation.x = state
-                .transform
-                .translation
-                .x
-                .clamp(-ergo.movement.plane_limit, ergo.movement.plane_limit);
-            state.transform.translation.z = state
-                .transform
-                .translation
-                .z
-                .clamp(-ergo.movement.plane_limit, ergo.movement.plane_limit);
-            state.color = input.color;
-            state.last_seen = Instant::now();
-        }
+        // Thin adapter over the shared sim. The Steam and LAN transports
+        // keep their authoritative state in differently-shaped containers
+        // (SteamSync fields vs. free-standing maps), but the simulation
+        // itself is transport-agnostic and must stay identical -- a
+        // divergence here means the same input produces different
+        // positions depending on which transport hosted the game.
+        crate::server_tick::step_authoritative_sim(
+            &mut steam.remote_states,
+            &steam.authoritative_inputs,
+            &mut steam.authoritative_vertical_velocity,
+            ergo,
+            dt,
+        );
     }
 
     fn host_broadcast_snapshot(steam: &SteamSync) {

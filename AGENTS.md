@@ -79,8 +79,14 @@ parallel implementations of the same auth/session/sim model — this is
 acknowledged tech debt (see doc comments in both files), not an oversight.
 Concretely:
 
-- `server_tick.rs`'s sim-step function mirrors `steam_mp::host_step_authoritative_sim`
-  near byte-for-byte.
+- ~~`server_tick.rs`'s sim-step function mirrors `steam_mp::host_step_authoritative_sim`
+  near byte-for-byte.~~ **Resolved.** `steam_mp::host_step_authoritative_sim`
+  is now a thin adapter that delegates to `server_tick::step_authoritative_sim`.
+  The two `RemoteState` / input-sample structs (which were field-for-field
+  identical) were also unified onto the `multiplayer::` definitions, so the
+  type system now prevents the sim from silently forking again.
+  `server_tick.rs` carries the tests, including one that pins both callers to
+  identical output.
 - Packet-codec glue (encode/decode wrappers) is duplicated between the two
   files, differing only in the magic/version constant.
 - Session/auth bookkeeping (challenge → proof → token → input-sequence
