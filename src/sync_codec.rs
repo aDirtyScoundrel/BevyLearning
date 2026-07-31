@@ -84,6 +84,9 @@ pub fn encode_freeze_packet(
     out
 }
 
+// Wire-format encoder: each arg is a distinct protocol field; grouping
+// them into a struct would just move the arity, not reduce it.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_projectile_packet(
     magic: [u8; 4],
     version: u8,

@@ -1038,6 +1038,8 @@ pub fn update_steam_server_browser_ui(
     }
 }
 
+// Bevy system: the argument list IS the dependency injection.
+#[allow(clippy::too_many_arguments)]
 pub fn update_wad_picker(
     keyboard_input: Res<ButtonInput<KeyCode>>,
     menu_state: Option<Res<EscapeMenuState>>,
@@ -1199,7 +1201,8 @@ fn collect_wad_candidates() -> Vec<String> {
     candidates
 }
 
-#[allow(clippy::type_complexity)]
+// Bevy system: the argument list IS the dependency injection.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn update_ergo_panel(
     mut commands: Commands,
     keyboard_input: Res<ButtonInput<KeyCode>>,

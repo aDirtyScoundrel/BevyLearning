@@ -32,15 +32,11 @@ pub struct CollisionDebugVisual;
 pub struct DoorCollisionDebugVisual;
 
 #[derive(Resource, Debug, Clone, Copy)]
+#[derive(Default)]
 pub struct CollisionDebugState {
     pub visible: bool,
 }
 
-impl Default for CollisionDebugState {
-    fn default() -> Self {
-        Self { visible: false }
-    }
-}
 
 #[derive(Message, Clone)]
 pub struct ReloadLevelRequest {
@@ -353,6 +349,8 @@ pub fn setup(
     }
 }
 
+// Bevy system: the argument list IS the dependency injection.
+#[allow(clippy::too_many_arguments)]
 pub fn handle_reload_level_requests(
     mut commands: Commands,
     mut requests: MessageReader<ReloadLevelRequest>,
@@ -583,6 +581,8 @@ pub fn update_camera_aim_cone(
     }
 }
 
+// Bevy system: the argument list IS the dependency injection.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_cone_projectile(
     mut commands: Commands,
     mouse_buttons: Res<ButtonInput<MouseButton>>,

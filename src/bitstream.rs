@@ -301,10 +301,10 @@ mod tests {
         assert_eq!(bytes[0], 0b00001101); // bits 0=1, 1=0, 2=1, 3=1 (LSB-first)
 
         let mut reader = BitStreamReader::new(bytes);
-        assert_eq!(reader.read_bit().unwrap(), true);
-        assert_eq!(reader.read_bit().unwrap(), false);
-        assert_eq!(reader.read_bit().unwrap(), true);
-        assert_eq!(reader.read_bit().unwrap(), true);
+        assert!(reader.read_bit().unwrap());
+        assert!(!reader.read_bit().unwrap());
+        assert!(reader.read_bit().unwrap());
+        assert!(reader.read_bit().unwrap());
     }
 
     #[test]

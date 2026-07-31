@@ -674,7 +674,7 @@ pub fn sync_remote_cubes(
                     },
                 ))
                 .with_children(|chicken| {
-                    crate::player::spawn_chicken_parts(chicken, &mut *meshes, &mut *materials);
+                    crate::player::spawn_chicken_parts(chicken, &mut meshes, &mut materials);
                 })
                 .id();
             network.spawned_entities.insert(*player_id, entity);
@@ -827,9 +827,8 @@ fn process_server_packet(network: &mut NetworkSync, from: SocketAddr, data: &[u8
     if let Some(proof) = decode_auth_proof(data) {
         if let Ok(disposition) =
             server.process_client_packet(from, learning::server::ServerIngressPacket::AuthResponse { proof })
-        {
-            if disposition == learning::server::PacketDisposition::Accepted {
-                if let Some(session_id) = server.session_by_addr.get(&from).copied()
+            && disposition == learning::server::PacketDisposition::Accepted
+                && let Some(session_id) = server.session_by_addr.get(&from).copied()
                     && let Some(session) = server.sessions.get(&session_id)
                     && let Some(token) = session.session_token
                     && let Some(player_id) = session.player_id
@@ -845,21 +844,19 @@ fn process_server_packet(network: &mut NetworkSync, from: SocketAddr, data: &[u8
                             last_seen: now,
                         });
                 }
-            }
-        }
         return;
     }
 
-    if let Some((session_token, input_sequence, payload)) = decode_input_packet(data) {
-        if let Ok(disposition) = server.process_client_packet(
+    if let Some((session_token, input_sequence, payload)) = decode_input_packet(data)
+        && let Ok(disposition) = server.process_client_packet(
             from,
             learning::server::ServerIngressPacket::ClientInput {
                 session_token,
                 input_sequence,
                 payload: &payload,
             },
-        ) {
-            if disposition == learning::server::PacketDisposition::Accepted
+        )
+            && disposition == learning::server::PacketDisposition::Accepted
                 && let Some(session_id) = server.session_by_addr.get(&from).copied()
                 && let Some(session) = server.sessions.get(&session_id)
                 && let Some(player_id) = session.player_id
@@ -880,8 +877,6 @@ fn process_server_packet(network: &mut NetworkSync, from: SocketAddr, data: &[u8
                     state.last_seen = now;
                 }
             }
-        }
-    }
 }
 
 fn server_broadcast_snapshot(network: &mut NetworkSync) {

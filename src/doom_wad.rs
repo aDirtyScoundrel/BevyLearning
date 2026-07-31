@@ -1055,11 +1055,10 @@ fn resolve_map_marker(lumps: &[LumpEntry], requested_map_name: &str) -> Result<S
 
     let markers = find_map_markers(lumps);
 
-    if requested == "MAP01" {
-        if markers.iter().any(|name| name == "E1M1") {
+    if requested == "MAP01"
+        && markers.iter().any(|name| name == "E1M1") {
             return Ok("E1M1".to_string());
         }
-    }
 
     if let Some(first) = markers.first() {
         println!(
@@ -1236,7 +1235,7 @@ fn parse_map_lumps(wad_bytes: &[u8], lumps: &[LumpEntry], map_name: &str) -> Res
 }
 
 fn parse_vertices(wad_bytes: &[u8], entry: &LumpEntry) -> Result<Vec<Vertex>, String> {
-    if entry.size % 4 != 0 {
+    if !entry.size.is_multiple_of(4) {
         return Err("VERTEXES lump size is not divisible by 4".to_string());
     }
 
@@ -1255,7 +1254,7 @@ fn parse_vertices(wad_bytes: &[u8], entry: &LumpEntry) -> Result<Vec<Vertex>, St
 
 fn parse_linedefs(wad_bytes: &[u8], entry: &LumpEntry) -> Result<Vec<LineDef>, String> {
     // Doom format uses 14-byte linedefs, Hexen format uses 16-byte linedefs.
-    if entry.size % 14 == 0 {
+    if entry.size.is_multiple_of(14) {
         let count = entry.size / 14;
         let mut linedefs = Vec::with_capacity(count);
 
@@ -1280,7 +1279,7 @@ fn parse_linedefs(wad_bytes: &[u8], entry: &LumpEntry) -> Result<Vec<LineDef>, S
         return Ok(linedefs);
     }
 
-    if entry.size % 16 == 0 {
+    if entry.size.is_multiple_of(16) {
         let count = entry.size / 16;
         let mut linedefs = Vec::with_capacity(count);
 
@@ -1313,7 +1312,7 @@ fn parse_linedefs(wad_bytes: &[u8], entry: &LumpEntry) -> Result<Vec<LineDef>, S
 }
 
 fn parse_sidedefs(wad_bytes: &[u8], entry: &LumpEntry) -> Result<Vec<SideDef>, String> {
-    if entry.size % 30 != 0 {
+    if !entry.size.is_multiple_of(30) {
         return Err("SIDEDEFS lump size is not divisible by 30".to_string());
     }
 
@@ -1334,7 +1333,7 @@ fn parse_sidedefs(wad_bytes: &[u8], entry: &LumpEntry) -> Result<Vec<SideDef>, S
 }
 
 fn parse_sectors(wad_bytes: &[u8], entry: &LumpEntry) -> Result<Vec<Sector>, String> {
-    if entry.size % 26 != 0 {
+    if !entry.size.is_multiple_of(26) {
         return Err("SECTORS lump size is not divisible by 26".to_string());
     }
 
@@ -1355,7 +1354,7 @@ fn parse_sectors(wad_bytes: &[u8], entry: &LumpEntry) -> Result<Vec<Sector>, Str
 }
 
 fn parse_things(wad_bytes: &[u8], entry: &LumpEntry) -> Result<Vec<Thing>, String> {
-    if entry.size % 10 != 0 {
+    if !entry.size.is_multiple_of(10) {
         return Err("THINGS lump size is not divisible by 10".to_string());
     }
 
@@ -1427,6 +1426,8 @@ fn doom_angle_to_yaw(angle_deg: i16) -> f32 {
     world_direction.x.atan2(-world_direction.y)
 }
 
+// Geometry helper: args are independent spawn parameters, not state.
+#[allow(clippy::too_many_arguments)]
 fn spawn_wall_band(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,

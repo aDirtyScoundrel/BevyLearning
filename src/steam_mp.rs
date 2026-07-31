@@ -994,7 +994,7 @@ mod imp {
                         },
                     ))
                     .with_children(|chicken| {
-                        crate::player::spawn_chicken_parts(chicken, &mut *meshes, &mut *materials);
+                        crate::player::spawn_chicken_parts(chicken, &mut meshes, &mut materials);
                     })
                     .id();
                 steam.spawned_entities.insert(*player_id, entity);
