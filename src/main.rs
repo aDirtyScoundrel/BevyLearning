@@ -20,6 +20,8 @@ use bevy::dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin};
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
 use bevy::input_focus::tab_navigation::TabNavigationPlugin;
 use bevy::prelude::*;
+use bevy::render::RenderPlugin;
+use bevy::render::settings::{Backends, RenderCreation, WgpuSettings};
 use bevy::ui::widget::TextShadow;
 use bevy::window::{PresentMode, Window, WindowPlugin};
 use mainmenu::AppState;
@@ -202,13 +204,31 @@ fn run_client() {
 
     let mut app = App::new();
 
-    app.add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                present_mode: PresentMode::AutoNoVsync,
+    app.add_plugins(
+        DefaultPlugins
+            .set(WindowPlugin {
+                primary_window: Some(Window {
+                    present_mode: PresentMode::AutoNoVsync,
+                    ..default()
+                }),
+                ..default()
+            })
+            .set(RenderPlugin {
+                // Pin the render backend to native Vulkan rather than letting
+                // wgpu auto-select. On Linux this avoids silently landing on
+                // the GL fallback, which has materially different performance
+                // and validation behavior from Vulkan.
+                //
+                // `Backends::from_env()` still wins when WGPU_BACKEND is set,
+                // so `WGPU_BACKEND=gl cargo run` remains available for
+                // debugging a suspected Vulkan driver issue.
+                render_creation: RenderCreation::Automatic(Box::new(WgpuSettings {
+                    backends: Some(Backends::from_env().unwrap_or(Backends::VULKAN)),
+                    ..default()
+                })),
                 ..default()
             }),
-            ..default()
-        }))
+    )
         .add_plugins(TabNavigationPlugin)
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .add_plugins(FpsOverlayPlugin {
