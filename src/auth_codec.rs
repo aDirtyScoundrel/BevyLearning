@@ -183,7 +183,15 @@ pub fn decode_snapshot_packet(magic: [u8; 4], version: u8, data: &[u8]) -> Optio
         return None;
     }
 
+    const RECORD_SIZE: usize = 24;
     let count = u32::from_le_bytes(data[6..10].try_into().ok()?) as usize;
+    // Never pre-allocate for more records than the buffer could possibly
+    // contain — a raw wire-controlled `count` near u32::MAX would otherwise
+    // trigger a multi-GB allocation attempt before any bounds are checked.
+    let max_possible_records = data.len().saturating_sub(10) / RECORD_SIZE;
+    if count > max_possible_records {
+        return None;
+    }
     let mut idx = 10;
     let mut out = Vec::with_capacity(count);
 
@@ -279,5 +287,20 @@ mod tests {
         assert_eq!(decoded[1].0, 2);
         assert!((decoded[0].1.translation.x - 1.0).abs() < 0.0001);
         assert!((decoded[1].1.translation.z - 4.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn snapshot_decode_rejects_oversized_count_without_allocating() {
+        // A crafted `count` near u32::MAX in a tiny buffer must be rejected
+        // before any large Vec::with_capacity allocation is attempted.
+        let mut data = Vec::new();
+        data.extend_from_slice(&TEST_MAGIC);
+        data.push(TEST_VERSION);
+        data.push(PACKET_SNAPSHOT);
+        data.extend_from_slice(&u32::MAX.to_le_bytes()); // malicious count
+        // No record bytes follow — buffer is far too small for u32::MAX records.
+
+        let decoded = decode_snapshot_packet(TEST_MAGIC, TEST_VERSION, &data);
+        assert_eq!(decoded, None);
     }
 }

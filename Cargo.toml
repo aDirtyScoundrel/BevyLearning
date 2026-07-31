@@ -9,5 +9,8 @@ steamworks = ["dep:steamworks"]
 
 [dependencies]
 bevy = { version = "0.19", features = ["bevy_dev_tools"] }
+hmac = "0.13.0"
+rand = "0.10.2"
+sha2 = "0.11.0"
 steamworks = { version = "0.11", optional = true }
 zip = { version = "2.2", default-features = true }
