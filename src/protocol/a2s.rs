@@ -71,19 +71,27 @@ impl ChallengeManager {
         }
     }
 
-    /// Issues a deterministic challenge for now.
-    /// TODO: replace with cryptographically strong random values.
+    /// Issues a CSPRNG-generated challenge for the given peer. Previously
+    /// this derived the challenge deterministically from `peer.port()`,
+    /// which any attacker could precompute — defeating the anti-spoofing
+    /// purpose of an A2S challenge entirely.
     pub fn issue(&mut self, peer: SocketAddr) -> i32 {
-        let challenge = (peer.port() as i32) ^ 0x5A5A_1234;
+        let challenge = rand::random::<i32>();
         self.by_peer.insert(peer, (challenge, Instant::now()));
         challenge
     }
 
+    /// Validates a challenge for the given peer. On success the challenge
+    /// is removed (single-use) — otherwise a captured challenge/response
+    /// pair could be replayed to validate more than once within the TTL.
     pub fn validate(&mut self, peer: SocketAddr, challenge: i32) -> bool {
         self.cleanup_expired();
         match self.by_peer.get(&peer) {
-            Some((stored, _)) => *stored == challenge,
-            None => false,
+            Some((stored, _)) if *stored == challenge => {
+                self.by_peer.remove(&peer);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -144,5 +152,25 @@ mod tests {
         let challenge = manager.issue(peer);
         assert!(manager.validate(peer, challenge));
         assert!(!manager.validate(peer, challenge.wrapping_add(1)));
+    }
+
+    #[test]
+    fn test_challenge_is_single_use() {
+        let mut manager = ChallengeManager::new(Duration::from_secs(60));
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 28000);
+        let challenge = manager.issue(peer);
+        assert!(manager.validate(peer, challenge));
+        // Reusing the same challenge after a successful validation must fail.
+        assert!(!manager.validate(peer, challenge));
+    }
+
+    #[test]
+    fn test_challenge_is_not_derived_from_port() {
+        // Regression guard: challenges must not be a deterministic function
+        // of the peer's port (the old vulnerable scheme).
+        let mut manager = ChallengeManager::new(Duration::from_secs(60));
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 28000);
+        let challenge = manager.issue(peer);
+        assert_ne!(challenge, (peer.port() as i32) ^ 0x5A5A_1234);
     }
 }

@@ -220,6 +220,7 @@ pub fn move_cube(
     mut input_intent: ResMut<PlayerInputIntent>,
     freeze: Res<MovementFreeze>,
     wad_collision: Option<Res<crate::doom_wad::WadCollisionWorld>>,
+    network: Option<Res<crate::multiplayer::NetworkSync>>,
     camera_rig: Query<&CameraOrbitRig>,
     mut query: Query<&mut Transform, With<crate::RotatingCube>>,
 ) {
@@ -227,7 +228,24 @@ pub fn move_cube(
         return;
     }
 
+    // On the LAN auth-server host, the local player's authoritative position
+    // comes from `server_tick::step_authoritative_sim` — same sim path used
+    // for every remote player — not from local physics here. This system
+    // still samples input/updates `input_intent` (needed to feed the sim)
+    // and still runs noclip (a local dev/debug fly mode, not part of
+    // server-authoritative gameplay state) but skips writing gravity/plane
+    // physics onto the rendered transform. See
+    // docs/THIN_CLIENT_MIGRATION.md slice 1. Steam host parity is a
+    // follow-up (`is_auth_server()` only exists on the LAN `NetworkSync`
+    // today).
+    let auth_server_owns_physics =
+        network.as_deref().is_some_and(|net| net.is_auth_server()) && !noclip.enabled;
+
     let frozen = freeze.active() && !noclip.enabled;
+    // Clamp dt to avoid a physics blowup after a frame stall (asset load,
+    // breakpoint, window minimize/focus loss). Mirrors the existing pattern
+    // already used in doom_wad.rs.
+    let dt = time.delta_secs().clamp(0.0, 0.1);
 
     let mut direction = Vec2::ZERO;
     if !frozen {
@@ -259,7 +277,7 @@ pub fn move_cube(
         } else {
             ((right_flat * direction.x) + (forward_flat * direction.y)).normalize()
                 * ergo.movement.move_speed
-                * time.delta_secs()
+                * dt
         };
 
         let noclip_delta = if noclip.enabled {
@@ -287,7 +305,7 @@ pub fn move_cube(
             }
 
             if fly_direction.length_squared() > 0.0 {
-                fly_direction.normalize() * ergo.movement.move_speed * time.delta_secs()
+                fly_direction.normalize() * ergo.movement.move_speed * dt
             } else {
                 Vec3::ZERO
             }
@@ -313,6 +331,14 @@ pub fn move_cube(
         let rest_y = crate::player::CUBE_REST_Y * player_scale;
         transform.scale = Vec3::splat(player_scale);
 
+        if auth_server_owns_physics {
+            // Position for the host's own player comes back from the
+            // authoritative sim via `multiplayer::apply_local_sim_result` —
+            // this system must not also mutate translation/vertical
+            // velocity, or the two would fight every frame.
+            continue;
+        }
+
         if !noclip.enabled
             && !frozen
             && transform.translation.y <= rest_y + 0.001
@@ -325,10 +351,10 @@ pub fn move_cube(
             movement_state.vertical_velocity = 0.0;
             transform.translation += noclip_movement;
         } else {
-            movement_state.vertical_velocity -= ergo.movement.gravity * time.delta_secs();
+            movement_state.vertical_velocity -= ergo.movement.gravity * dt;
 
             transform.translation += horizontal_movement;
-            transform.translation.y += movement_state.vertical_velocity * time.delta_secs();
+            transform.translation.y += movement_state.vertical_velocity * dt;
 
             transform.translation.x = transform
                 .translation

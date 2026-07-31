@@ -106,6 +106,9 @@ mod imp {
         player_id: u64,
         nonce: u64,
         token: Option<learning::auth::SessionToken>,
+        /// Last time this peer's auth/input traffic was processed — used to
+        /// evict abandoned sessions (see `sweep_expired_auth_sessions`).
+        last_activity: Instant,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -957,6 +960,7 @@ mod imp {
             now,
             PROJECTILE_DEDUP_TTL,
         );
+        sweep_expired_auth_sessions(steam, REMOTE_TIMEOUT);
 
         for (player_id, state) in &steam.remote_states {
             if let Some(entity) = steam.spawned_entities.get(player_id).copied() {
@@ -1166,6 +1170,7 @@ mod imp {
                     player_id,
                     nonce,
                     token: None,
+                    last_activity: Instant::now(),
                 },
             );
             steam.metrics.host_auth_challenges_sent += 1;
@@ -1225,12 +1230,18 @@ mod imp {
                 return;
             }
 
+            if let Some(session) = steam.auth_sessions.get_mut(&remote) {
+                session.last_activity = Instant::now();
+            }
+
             let last_sequence = steam
                 .last_input_sequence_by_player
                 .get(&player_id)
                 .copied()
                 .unwrap_or(0);
-            if input_sequence <= last_sequence {
+            // Wraparound-aware comparison — see server/session.rs::accepts_input_sequence.
+            let is_newer = (input_sequence.wrapping_sub(last_sequence) as i32) > 0;
+            if !is_newer {
                 steam.metrics.host_replay_drops += 1;
                 return;
             }
@@ -1436,13 +1447,38 @@ mod imp {
         let _ = networking.send_p2p_packet(target, send_type, payload);
     }
 
-    /// Generate a unique challenge nonce from the current wall-clock nanoseconds.
+    /// Generate a unique challenge nonce via CSPRNG.
     /// Used when a peer sends a hello with no existing auth session.
     fn fresh_nonce() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0)
+        learning::auth::fresh_nonce()
+    }
+
+    /// Evicts host-side auth/session state for peers that haven't sent any
+    /// auth or input traffic within `timeout`. Without this, `auth_sessions`,
+    /// `token_to_player`, `player_ingress_peer`, and
+    /// `last_input_sequence_by_player` grow forever as players leave —
+    /// unlike `remote_states`, which already gets pruned by
+    /// `prune_remote_states`.
+    fn sweep_expired_auth_sessions(steam: &mut SteamSync, timeout: Duration) {
+        let now = Instant::now();
+        let expired: Vec<steamworks::SteamId> = steam
+            .auth_sessions
+            .iter()
+            .filter(|(_, session)| now.duration_since(session.last_activity) > timeout)
+            .map(|(peer, _)| *peer)
+            .collect();
+
+        for peer in expired {
+            if let Some(session) = steam.auth_sessions.remove(&peer) {
+                if let Some(token) = session.token {
+                    steam.token_to_player.remove(&token);
+                }
+                steam.player_ingress_peer.remove(&session.player_id);
+                steam.last_input_sequence_by_player.remove(&session.player_id);
+                steam.authoritative_inputs.remove(&session.player_id);
+                steam.authoritative_vertical_velocity.remove(&session.player_id);
+            }
+        }
     }
 
     fn encode_auth_hello(player_id: u64) -> Vec<u8> {

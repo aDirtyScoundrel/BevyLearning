@@ -23,7 +23,7 @@ const PACKET_LEAVE: u8 = 3;       // graceful disconnect notice
 const PACKET_FREEZE: u8 = 4;      // freeze a target player briefly
 const PACKET_PROJECTILE: u8 = 5;  // replicate a projectile spawn
 
-const SYNC_PORT: u16 = 34567;
+pub(crate) const SYNC_PORT: u16 = 34567;
 // Tick rate for outbound state packets (~20 Hz).
 const SEND_INTERVAL: Duration = Duration::from_millis(50);
 // Drop a remote peer's state after this much silence.
@@ -123,6 +123,16 @@ pub struct NetworkSync {
     seen_projectiles: HashMap<(u64, u32), Instant>,
 }
 
+impl NetworkSync {
+    /// True when this peer is running as the LAN authoritative server —
+    /// its own local player must be simulated the same way as every remote
+    /// player, not trusted as ground truth. See
+    /// docs/THIN_CLIENT_MIGRATION.md slice 1.
+    pub fn is_auth_server(&self) -> bool {
+        self.role == RuntimeNetRole::AuthServer
+    }
+}
+
 /// Send `payload` to `target_addr` via UDP (fire-and-forget; errors are silently dropped).
 fn send_payload(network: &NetworkSync, payload: &[u8]) {
     let _ = network.socket.send_to(payload, network.target_addr);
@@ -189,8 +199,43 @@ pub fn generate_local_player_id() -> LocalPlayerId {
     }
 }
 
-pub fn setup_network(mut commands: Commands) {
-    let bind_addr = format!("0.0.0.0:{}", SYNC_PORT);
+/// Overrides `setup_network`'s usual env-var-based role detection to force
+/// a loopback `UntrustedClient` connection to an embedded server
+/// subprocess. Inserted by `singleplayer.rs` before entering `AppState::InGame`
+/// in single-player mode; absent for every other run mode (LAN/Steam/
+/// headless server all keep using env vars exactly as before).
+#[derive(Resource, Debug, Clone)]
+pub struct SinglePlayerConnect {
+    pub target_addr: SocketAddr,
+    pub auth_secret: String,
+}
+
+pub fn setup_network(mut commands: Commands, single_player: Option<Res<SinglePlayerConnect>>) {
+    let role = if single_player.is_some() {
+        RuntimeNetRole::UntrustedClient
+    } else if env::var("CUBE_AUTH_SERVER")
+        .ok()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    {
+        RuntimeNetRole::AuthServer
+    } else if env::var("CUBE_AUTH_SERVER_ADDR").is_ok() {
+        RuntimeNetRole::UntrustedClient
+    } else {
+        RuntimeNetRole::LegacyPeer
+    };
+
+    // AuthServer and LegacyPeer both need the well-known port — the server
+    // must be discoverable there, and LegacyPeer's broadcast model assumes
+    // every peer listens on the same fixed port. UntrustedClient has no such
+    // requirement (the auth handshake replies to whatever source address the
+    // packet arrived from) and binding an ephemeral port instead lets a
+    // client run in the same process/host as its own embedded server — see
+    // `singleplayer.rs`, which spawns a headless server subprocess still
+    // bound to SYNC_PORT while this process connects to it as a client.
+    let bind_addr = match role {
+        RuntimeNetRole::UntrustedClient => "0.0.0.0:0".to_string(),
+        RuntimeNetRole::AuthServer | RuntimeNetRole::LegacyPeer => format!("0.0.0.0:{}", SYNC_PORT),
+    };
     let socket = match UdpSocket::bind(&bind_addr) {
         Ok(socket) => socket,
         Err(err) => {
@@ -209,20 +254,14 @@ pub fn setup_network(mut commands: Commands) {
         return;
     }
 
-    let role = if env::var("CUBE_AUTH_SERVER")
-        .ok()
-        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-    {
-        RuntimeNetRole::AuthServer
-    } else if env::var("CUBE_AUTH_SERVER_ADDR").is_ok() {
-        RuntimeNetRole::UntrustedClient
-    } else {
-        RuntimeNetRole::LegacyPeer
-    };
-
-    let target_addr = env::var("CUBE_AUTH_SERVER_ADDR")
-        .ok()
-        .and_then(|s| s.parse::<SocketAddr>().ok())
+    let target_addr = single_player
+        .as_ref()
+        .map(|sp| sp.target_addr)
+        .or_else(|| {
+            env::var("CUBE_AUTH_SERVER_ADDR")
+                .ok()
+                .and_then(|s| s.parse::<SocketAddr>().ok())
+        })
         .or_else(|| {
             env::var("CUBE_SYNC_TARGET")
                 .ok()
@@ -231,18 +270,28 @@ pub fn setup_network(mut commands: Commands) {
         .unwrap_or_else(|| SocketAddr::from(([255, 255, 255, 255], SYNC_PORT)));
 
     let server_runtime = if role == RuntimeNetRole::AuthServer {
-        Some(learning::server::ServerNetworkManager::new(
+        let auth_secret = env::var("CUBE_AUTH_SECRET").unwrap_or_else(|_| "dev-auth-secret".to_string());
+        Some(learning::server::ServerNetworkManager::with_auth(
             SocketAddr::from(([0, 0, 0, 0], SYNC_PORT)),
+            learning::server::ServerAuthConfig {
+                auth_secret: auth_secret.clone(),
+                token_secret: auth_secret,
+            },
         ))
     } else {
         None
     };
 
     let client_manager = if role == RuntimeNetRole::UntrustedClient {
+        let auth_secret = single_player
+            .as_ref()
+            .map(|sp| sp.auth_secret.clone())
+            .or_else(|| env::var("CUBE_AUTH_SECRET").ok())
+            .unwrap_or_else(|| "dev-auth-secret".to_string());
         let mut manager = learning::client::ClientNetworkManager::with_identity(
             target_addr,
             generate_local_player_id().value,
-            env::var("CUBE_AUTH_SECRET").unwrap_or_else(|_| "dev-auth-secret".to_string()),
+            auth_secret,
         );
         let _ = manager.connect();
         Some(manager)
@@ -442,6 +491,24 @@ pub fn send_local_state(
                 return;
             }
 
+            // The host's own player goes through the exact same
+            // authoritative sim as every remote player — it is not
+            // trusted as ground truth. See docs/THIN_CLIENT_MIGRATION.md
+            // slice 1. `move_cube` no longer writes physics for this
+            // player when `is_auth_server()` is true; the result comes
+            // back via `apply_local_sim_result`.
+            if let (Some(hud), Some(input_intent)) = (hud.as_ref(), input_intent.as_ref()) {
+                network.authoritative_inputs.insert(
+                    local_player.value,
+                    PlayerInputSample {
+                        move_x: input_intent.move_x,
+                        move_z: input_intent.move_z,
+                        jump: input_intent.jump,
+                        color: hud.selected_color(),
+                    },
+                );
+            }
+
             crate::server_tick::step_authoritative_sim(
                 &mut network.remote_states,
                 &network.authoritative_inputs,
@@ -454,6 +521,31 @@ pub fn send_local_state(
             network.last_send = Instant::now();
         }
     }
+}
+
+/// Copies the host's own authoritative sim result (written into
+/// `remote_states` by `send_local_state`'s `AuthServer` branch, keyed by
+/// the host's own player id) back onto the rendered local player entity.
+/// This is the other half of slice 1 in docs/THIN_CLIENT_MIGRATION.md —
+/// `move_cube` intentionally stops writing this transform on the host.
+pub fn apply_local_sim_result(
+    local_player: Res<LocalPlayerId>,
+    network: Option<Res<NetworkSync>>,
+    mut local_cube: Query<&mut Transform, With<crate::RotatingCube>>,
+) {
+    let Some(network) = network.as_deref() else {
+        return;
+    };
+    if !network.is_auth_server() {
+        return;
+    }
+    let Some(state) = network.remote_states.get(&local_player.value) else {
+        return;
+    };
+    let Ok(mut transform) = local_cube.single_mut() else {
+        return;
+    };
+    *transform = state.transform;
 }
 
 pub fn receive_remote_states(
@@ -508,6 +600,7 @@ pub fn sync_remote_projectiles(
 }
 
 pub fn sync_remote_cubes(
+    local_player: Res<LocalPlayerId>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -537,8 +630,18 @@ pub fn sync_remote_cubes(
         now,
         PROJECTILE_DEDUP_TTL,
     );
+    if let Some(server) = network.server_runtime.as_mut() {
+        server.sweep_expired_sessions(REMOTE_TIMEOUT);
+    }
 
+    // The host's own player (see `apply_local_sim_result`) is now present
+    // in `remote_states` on the auth-server so it gets simulated/broadcast
+    // like everyone else, but it must never get a duplicate `RemoteCube`
+    // visual entity here — it renders through the local `RotatingCube`.
     for (player_id, state) in &network.remote_states {
+        if *player_id == local_player.value {
+            continue;
+        }
         if let Some(entity) = network.spawned_entities.get(player_id).copied() {
             if let Ok((_entity, mut transform, remote, material_handle)) = cube_query.get_mut(entity) {
                 let _ = remote.player_id;

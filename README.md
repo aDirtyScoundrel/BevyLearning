@@ -25,7 +25,10 @@ A 3D multiplayer game built with Rust and Bevy. You play as a chicken on a share
 ## Run
 
 ```bash
-# Default (LAN, no Steam)
+# Default (LAN, no Steam) — launches to a title screen with "Single Player"
+# and "Quit". Single Player spawns a local headless auth-server subprocess
+# and connects to it as an ordinary multiplayer client over loopback — no
+# separate single-player code path.
 cargo run
 
 # Load a DOOM map container (WAD or PK3, defaults to MAP01)
@@ -36,7 +39,24 @@ cargo run --release
 
 # Steam P2P enabled
 cargo run --features steamworks
+
+# Join an existing multiplayer host directly, bypassing the title screen
+# (unchanged from before — see Multiplayer section below):
+CUBE_AUTH_SERVER_ADDR=<host_ip>:34567 CUBE_AUTH_SECRET=<secret> cargo run
 ```
+
+## Title Screen
+
+On launch you'll see a menu with two options:
+
+- **Single Player** — spawns a headless authoritative-server subprocess
+  (same binary, `CUBE_AUTH_SERVER=1`) and connects this window to it as a
+  client over `127.0.0.1`. Closing the window kills the subprocess
+  automatically.
+- **Quit** — exits immediately.
+
+Launching with `CUBE_AUTH_SERVER_ADDR` set (see Multiplayer below) skips
+the title screen entirely and joins that host directly, same as before.
 
 ## Controls
 

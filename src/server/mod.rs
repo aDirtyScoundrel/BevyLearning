@@ -7,7 +7,6 @@ pub mod session;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct ServerAuthConfig {
@@ -60,6 +59,9 @@ pub struct ServerNetworkManager {
     pub session_by_addr: HashMap<SocketAddr, u32>,
     /// Server auth config/secrets
     pub auth: ServerAuthConfig,
+    /// Monotonic counter for session IDs — avoids collisions after removal
+    /// that a `sessions.len()`-based scheme would produce.
+    next_session_id: u32,
 }
 
 impl ServerNetworkManager {
@@ -74,6 +76,7 @@ impl ServerNetworkManager {
             sessions: HashMap::new(),
             session_by_addr: HashMap::new(),
             auth,
+            next_session_id: 0,
         }
     }
 
@@ -86,12 +89,14 @@ impl ServerNetworkManager {
     /// Handles incoming connection request
     pub fn handle_connection_request(&mut self, from_addr: SocketAddr) -> io::Result<(u32, ServerEgressPacket)> {
         if let Some(existing_id) = self.session_by_addr.get(&from_addr).copied()
-            && let Some(existing) = self.sessions.get(&existing_id)
+            && let Some(existing) = self.sessions.get_mut(&existing_id)
         {
+            existing.touch();
             return Ok((existing_id, ServerEgressPacket::AuthChallenge { nonce: existing.auth_nonce }));
         }
 
-        let session_id = self.sessions.len() as u32;
+        let session_id = self.next_session_id;
+        self.next_session_id = self.next_session_id.wrapping_add(1);
         let nonce = Self::fresh_nonce();
         let session = session::ClientSession::new(session_id, from_addr, nonce);
 
@@ -156,6 +161,7 @@ impl ServerNetworkManager {
                     return Ok(PacketDisposition::Rejected);
                 }
 
+                session.touch();
                 session.process_input(payload)?;
                 Ok(PacketDisposition::Accepted)
             }
@@ -169,11 +175,25 @@ impl ServerNetworkManager {
         }
     }
 
+    /// Evicts sessions that haven't sent a valid packet within `timeout`.
+    /// Without this, connect/disconnect churn (or repeated spoofed hellos —
+    /// this is UDP with no return-routability check) grows `sessions` and
+    /// `session_by_addr` forever, since `close_session` had no caller.
+    pub fn sweep_expired_sessions(&mut self, timeout: std::time::Duration) {
+        let now = std::time::Instant::now();
+        let expired: Vec<u32> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| now.duration_since(session.last_activity) > timeout)
+            .map(|(id, _)| *id)
+            .collect();
+        for session_id in expired {
+            self.close_session(session_id);
+        }
+    }
+
     fn fresh_nonce() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0)
+        crate::auth::fresh_nonce()
     }
 }
 

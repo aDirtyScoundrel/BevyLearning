@@ -4,8 +4,20 @@
 //! Uses BitStream with Huffman compression for efficient encoding.
 
 use std::io;
+use std::sync::OnceLock;
 use crate::bitstream::{BitStreamReader, BitStreamWriter};
 use crate::huffman::HuffmanCodec;
+
+/// Shared Huffman codec instance. `HuffmanCodec::new()` rebuilds the full
+/// tree from the (constant) Tribes frequency table — building it once per
+/// string field decoded/encoded (up to 18x per GameInfo packet at max
+/// player count) was a real CPU-amplification cost on the hottest
+/// network-facing parse path. The tree is static/hardcoded, not
+/// attacker-influenced, so sharing one instance across all calls is safe.
+fn huffman_codec() -> &'static HuffmanCodec {
+    static CODEC: OnceLock<HuffmanCodec> = OnceLock::new();
+    CODEC.get_or_init(HuffmanCodec::new)
+}
 
 /// Player information in GameInfo packet
 #[derive(Debug, Clone)]
@@ -143,7 +155,7 @@ impl GameInfo {
 
         let rem = reader.remaining_bytes();
 
-        let codec = HuffmanCodec::new();
+        let codec = huffman_codec();
         let (s, consumed) = codec.decode_string(rem)?;
 
         // Advance outer reader by the consumed bytes
@@ -158,7 +170,7 @@ impl GameInfo {
         s: &str,
     ) -> io::Result<()> {
         // Use Huffman codec to encode the string as a byte-aligned block
-        let codec = HuffmanCodec::new();
+        let codec = huffman_codec();
         let encoded = codec.encode_string(s)?;
 
         // Ensure byte alignment then write encoded bytes

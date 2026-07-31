@@ -4,6 +4,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::time::Instant;
 
 /// Server-side per-client session
 #[derive(Debug, Clone)]
@@ -24,6 +25,10 @@ pub struct ClientSession {
     pub last_input_sequence: u32,
     /// Client-specific game state
     pub game_state: Vec<u8>,
+    /// Wall-clock time this session last sent any packet we processed.
+    /// Used to evict abandoned sessions so a churn of connect/disconnect
+    /// (or spoofed source addresses) can't grow `sessions` unbounded.
+    pub last_activity: Instant,
 }
 
 impl ClientSession {
@@ -38,7 +43,13 @@ impl ClientSession {
             session_token: None,
             last_input_sequence: 0,
             game_state: Vec::new(),
+            last_activity: Instant::now(),
         }
+    }
+
+    /// Records that this session was just active (received a valid packet).
+    pub fn touch(&mut self) {
+        self.last_activity = Instant::now();
     }
 
     pub fn is_authenticated(&self) -> bool {
@@ -56,7 +67,12 @@ impl ClientSession {
     }
 
     pub fn accepts_input_sequence(&mut self, input_sequence: u32) -> bool {
-        if input_sequence <= self.last_input_sequence {
+        // Wraparound-aware comparison: treats sequence numbers as a circular
+        // space so that after ~4B inputs wrap past u32::MAX, comparisons
+        // keep working instead of permanently rejecting every future input
+        // (raw `<=` against a wrapped value never recovers).
+        let is_newer = (input_sequence.wrapping_sub(self.last_input_sequence) as i32) > 0;
+        if !is_newer {
             return false;
         }
         self.last_input_sequence = input_sequence;
@@ -88,5 +104,36 @@ impl ClientSession {
     /// Closes the session
     pub fn close(&mut self) {
         self.state = crate::connection::ConnectionState::Closed;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_session() -> ClientSession {
+        ClientSession::new(0, "127.0.0.1:9000".parse().unwrap(), 0)
+    }
+
+    #[test]
+    fn rejects_replayed_and_stale_sequences() {
+        let mut session = new_session();
+        assert!(session.accepts_input_sequence(5));
+        assert!(!session.accepts_input_sequence(5)); // exact replay
+        assert!(!session.accepts_input_sequence(3)); // stale
+        assert!(session.accepts_input_sequence(6)); // newer
+    }
+
+    #[test]
+    fn accepts_sequence_after_u32_wraparound() {
+        let mut session = new_session();
+        session.last_input_sequence = u32::MAX - 1;
+        // A raw `<=` comparison would reject every sequence after wrapping
+        // to a small value near 0. The wraparound-aware comparison must
+        // still treat post-wrap sequences as newer.
+        assert!(session.accepts_input_sequence(u32::MAX));
+        assert!(session.accepts_input_sequence(0)); // wrapped past MAX
+        assert!(session.accepts_input_sequence(1));
+        assert!(!session.accepts_input_sequence(0)); // now stale again
     }
 }

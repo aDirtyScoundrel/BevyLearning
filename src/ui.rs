@@ -1699,19 +1699,19 @@ fn load_ergo_preset(slot: ErgoPresetSlot) -> Result<crate::config::HumanErgoConf
         };
 
         match key {
-            "move_speed" => loaded.movement.move_speed = value,
-            "jump_velocity" => loaded.movement.jump_velocity = value,
-            "gravity" => loaded.movement.gravity = value,
-            "plane_limit" => loaded.movement.plane_limit = value,
-            "player_scale" => loaded.movement.player_scale = value,
-            "camera_sensitivity_x" => loaded.camera.sensitivity_x = value,
-            "camera_sensitivity_y" => loaded.camera.sensitivity_y = value,
-            "camera_pitch_limit" => loaded.camera.pitch_limit = value,
-            "wing_flap_duration" => loaded.wing_flap.duration_secs = value,
-            "wing_flap_angle" => loaded.wing_flap.angle_radians = value,
-            "walk_cycle_rate" => loaded.walk_cycle.cycle_rate = value,
-            "walk_cycle_swing" => loaded.walk_cycle.max_swing_radians = value,
-            "walk_cycle_lift" => loaded.walk_cycle.lift_amount = value,
+            "move_speed" => ErgoSetting::MoveSpeed.set_value(&mut loaded, value),
+            "jump_velocity" => ErgoSetting::JumpVelocity.set_value(&mut loaded, value),
+            "gravity" => ErgoSetting::Gravity.set_value(&mut loaded, value),
+            "plane_limit" => ErgoSetting::PlaneLimit.set_value(&mut loaded, value),
+            "player_scale" => ErgoSetting::PlayerScale.set_value(&mut loaded, value),
+            "camera_sensitivity_x" => ErgoSetting::CameraSensitivityX.set_value(&mut loaded, value),
+            "camera_sensitivity_y" => ErgoSetting::CameraSensitivityY.set_value(&mut loaded, value),
+            "camera_pitch_limit" => ErgoSetting::CameraPitchLimit.set_value(&mut loaded, value),
+            "wing_flap_duration" => ErgoSetting::WingFlapDuration.set_value(&mut loaded, value),
+            "wing_flap_angle" => ErgoSetting::WingFlapAngle.set_value(&mut loaded, value),
+            "walk_cycle_rate" => ErgoSetting::WalkCycleRate.set_value(&mut loaded, value),
+            "walk_cycle_swing" => ErgoSetting::WalkCycleSwing.set_value(&mut loaded, value),
+            "walk_cycle_lift" => ErgoSetting::WalkCycleLift.set_value(&mut loaded, value),
             _ => {}
         }
         any_loaded = true;
