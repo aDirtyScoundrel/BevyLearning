@@ -13,6 +13,8 @@ mod doom_wad;
 mod sync_codec;
 mod remote_runtime;
 mod server_tick;
+mod mainmenu;
+mod singleplayer;
 
 use bevy::dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin};
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
@@ -20,6 +22,7 @@ use bevy::input_focus::tab_navigation::TabNavigationPlugin;
 use bevy::prelude::*;
 use bevy::ui::widget::TextShadow;
 use bevy::window::{PresentMode, Window, WindowPlugin};
+use mainmenu::AppState;
 use std::time::Duration;
 use std::fs;
 
@@ -90,48 +93,75 @@ fn capture_app_exit(
     }
 }
 
+/// Skips the main menu when this process was launched pointed at an
+/// existing multiplayer host (`CUBE_AUTH_SERVER_ADDR` set) — the LAN/Steam
+/// client-join flow driven by env vars is unchanged by the addition of the
+/// title screen; only a plain launch with no target host shows the menu.
+fn skip_menu_for_existing_join_target(mut next_state: ResMut<NextState<AppState>>) {
+    if std::env::var("CUBE_AUTH_SERVER_ADDR").is_ok() {
+        next_state.set(AppState::InGame);
+    }
+}
+
 fn add_player_controller_systems(app: &mut App) {
     app.add_systems(
         Update,
-        controls::toggle_noclip.before(controls::move_cube),
+        controls::toggle_noclip
+            .before(controls::move_cube)
+            .run_if(in_state(AppState::InGame)),
     )
     .add_systems(
         Update,
         (
             controls::mouse_look,
             controls::move_cube,
-        ),
+        )
+            .run_if(in_state(AppState::InGame)),
     )
     .add_systems(
         Update,
         controls::follow_cube_camera
-            .after(controls::move_cube),
+            .after(controls::move_cube)
+            .run_if(in_state(AppState::InGame)),
     )
     .add_systems(
         Update,
-        controls::tick_movement_freeze.before(controls::move_cube),
+        controls::tick_movement_freeze
+            .before(controls::move_cube)
+            .run_if(in_state(AppState::InGame)),
     )
     .add_systems(
         Update,
         multiplayer::apply_local_freeze
             .after(multiplayer::receive_remote_states)
-            .before(controls::move_cube),
+            .before(controls::move_cube)
+            .run_if(in_state(AppState::InGame)),
     )
     .add_systems(
         Update,
         multiplayer::apply_local_reconciliation
-            .after(controls::move_cube),
+            .after(controls::move_cube)
+            .run_if(in_state(AppState::InGame)),
+    )
+    .add_systems(
+        Update,
+        multiplayer::apply_local_sim_result
+            .after(multiplayer::send_local_state)
+            .after(controls::move_cube)
+            .run_if(in_state(AppState::InGame)),
     )
     .add_systems(
         Update,
         steam_mp::apply_local_reconciliation
-            .after(controls::move_cube),
+            .after(controls::move_cube)
+            .run_if(in_state(AppState::InGame)),
     )
     .add_systems(
         Update,
         steam_mp::apply_local_freeze
             .after(steam_mp::receive_remote_states)
-            .before(controls::move_cube),
+            .before(controls::move_cube)
+            .run_if(in_state(AppState::InGame)),
     );
 }
 
@@ -193,6 +223,7 @@ fn run_client() {
                 ..default()
             },
         })
+        .init_state::<AppState>()
         .insert_resource(config::HumanErgoConfig::default())
         .insert_resource(controls::ControlBindings::default())
         .insert_resource(controls::MovementState::default())
@@ -205,8 +236,19 @@ fn run_client() {
         .insert_resource(ExitRequested::default())
         .insert_resource(local_player_id)
         .add_message::<scene::ReloadLevelRequest>()
+        .add_systems(Startup, skip_menu_for_existing_join_target)
+        // ── Main menu (title screen) ────────────────────────────────────────
+        .add_systems(OnEnter(AppState::MainMenu), mainmenu::setup_main_menu)
         .add_systems(
-            Startup,
+            Update,
+            mainmenu::update_main_menu.run_if(in_state(AppState::MainMenu)),
+        )
+        .add_systems(OnExit(AppState::MainMenu), mainmenu::teardown_main_menu)
+        // ── In-game one-time setup (was unconditional Startup; now runs once
+        // per entry into AppState::InGame — the main menu's "Single Player"
+        // button is what actually drives entry here for now) ───────────────
+        .add_systems(
+            OnEnter(AppState::InGame),
             (
                 multiplayer::setup_network,
                 steam_mp::setup_steam_sync,
@@ -220,13 +262,19 @@ fn run_client() {
             ),
         )
         .add_systems(
-            Startup,
+            OnEnter(AppState::InGame),
             steam_mp::auto_refresh_browser_on_startup
                 .after(steam_mp::setup_steam_sync),
         )
         .add_systems(
             Update,
-            (capture_app_exit, steam_mp::send_local_leave, multiplayer::send_local_leave).chain(),
+            (
+                capture_app_exit,
+                steam_mp::send_local_leave,
+                multiplayer::send_local_leave,
+                singleplayer::shutdown_embedded_server,
+            )
+                .chain(),
         )
         .add_systems(
             Update,
@@ -243,7 +291,8 @@ fn run_client() {
                 steam_mp::process_callbacks,
                 steam_mp::announce_local_presence,
                 steam_mp::receive_remote_states,
-            ),
+            )
+                .run_if(in_state(AppState::InGame)),
         )
         .add_systems(
             Update,
@@ -257,19 +306,33 @@ fn run_client() {
                 multiplayer::sync_remote_projectiles,
                 multiplayer::send_local_state,
                 style_fps_overlay_shadow,
-            ),
+            )
+                .run_if(in_state(AppState::InGame)),
         )
-        .add_systems(Update, steam_mp::update_steam_metrics_overlay)
-        .add_systems(Update, ui::update_wad_picker)
-        .add_systems(Update, scene::update_collision_debug_visibility)
-        .add_systems(Update, doom_wad::update_wad_doors)
-        .add_systems(Update, scene::handle_reload_level_requests)
+        .add_systems(
+            Update,
+            steam_mp::update_steam_metrics_overlay.run_if(in_state(AppState::InGame)),
+        )
+        .add_systems(Update, ui::update_wad_picker.run_if(in_state(AppState::InGame)))
+        .add_systems(
+            Update,
+            scene::update_collision_debug_visibility.run_if(in_state(AppState::InGame)),
+        )
+        .add_systems(
+            Update,
+            doom_wad::update_wad_doors.run_if(in_state(AppState::InGame)),
+        )
+        .add_systems(
+            Update,
+            scene::handle_reload_level_requests.run_if(in_state(AppState::InGame)),
+        )
         .add_systems(
             Update,
             (
                 ui::update_ergo_panel,
                 ui::update_ergo_slider_visuals,
-            ),
+            )
+                .run_if(in_state(AppState::InGame)),
         );
 
     add_player_controller_systems(&mut app);
@@ -281,19 +344,24 @@ fn run_client() {
                 player::flap_wings_on_jump,
                 player::animate_wing_flap,
                 player::animate_walk_cycle,
-            ),
+            )
+                .run_if(in_state(AppState::InGame)),
         )
         .add_systems(
             Update,
-            scene::update_camera_aim_cone.after(controls::follow_cube_camera),
+            scene::update_camera_aim_cone
+                .after(controls::follow_cube_camera)
+                .run_if(in_state(AppState::InGame)),
         )
         .add_systems(
             Update,
             (
                 scene::spawn_cone_projectile.after(scene::update_camera_aim_cone),
                 scene::update_cone_projectiles,
+                scene::update_muzzle_flashes, // Clean up 50ms muzzle flashes
                 scene::resolve_projectile_collisions.after(scene::update_cone_projectiles),
-            ),
+            )
+                .run_if(in_state(AppState::InGame)),
         );
 
     app.run();
@@ -308,5 +376,3 @@ fn main() {
         run_client();
     }
 }
-
-
