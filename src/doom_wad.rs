@@ -1763,8 +1763,22 @@ fn parse_map_lumps(wad_bytes: &[u8], lumps: &[LumpEntry], map_name: &str) -> Res
 
     let things_lump = search_slice.iter().find(|entry| entry.name == "THINGS");
 
+    // A Hexen-format map carries a BEHAVIOR lump in its directory section;
+    // Doom/Boom maps never do. Bound the scan at the next map marker so a
+    // later Hexen map in a mixed PWAD cannot flip this map's format. Size
+    // divisibility alone is ambiguous: a Hexen LINEDEFS lump whose record
+    // count is a multiple of 7 is also divisible by 14 and would silently
+    // misparse as Doom records with shifted fields.
+    let section_end = search_slice
+        .iter()
+        .position(|entry| is_map_marker_name(&entry.name))
+        .unwrap_or(search_slice.len());
+    let hexen_format = search_slice[..section_end]
+        .iter()
+        .any(|entry| entry.name == "BEHAVIOR");
+
     let vertices = parse_vertices(wad_bytes, vertices_lump)?;
-    let linedefs = parse_linedefs(wad_bytes, linedefs_lump)?;
+    let linedefs = parse_linedefs(wad_bytes, linedefs_lump, hexen_format)?;
     let sidedefs = parse_sidedefs(wad_bytes, sidedefs_lump)?;
     let sectors = parse_sectors(wad_bytes, sectors_lump)?;
     let things = if let Some(things_lump) = things_lump {
@@ -1800,9 +1814,12 @@ fn parse_vertices(wad_bytes: &[u8], entry: &LumpEntry) -> Result<Vec<Vertex>, St
     Ok(vertices)
 }
 
-fn parse_linedefs(wad_bytes: &[u8], entry: &LumpEntry) -> Result<Vec<LineDef>, String> {
+fn parse_linedefs(wad_bytes: &[u8], entry: &LumpEntry, hexen_format: bool) -> Result<Vec<LineDef>, String> {
     // Doom format uses 14-byte linedefs, Hexen format uses 16-byte linedefs.
-    if entry.size.is_multiple_of(14) {
+    // The map directory's BEHAVIOR lump decides when present; divisibility is
+    // only a fallback, because a Hexen lump with a record count that is a
+    // multiple of 7 is also divisible by 14.
+    if !hexen_format && entry.size.is_multiple_of(14) {
         let count = entry.size / 14;
         let mut linedefs = Vec::with_capacity(count);
 
@@ -2702,6 +2719,110 @@ fn read_i16_le(bytes: &[u8], offset: usize) -> Result<i16, String> {
         .get(offset..offset + 2)
         .ok_or_else(|| format!("offset {} out of bounds for i16", offset))?;
     Ok(i16::from_le_bytes([range[0], range[1]]))
+}
+
+#[cfg(test)]
+mod hexen_format_tests {
+    use super::*;
+
+    /// Build a minimal in-memory PWAD from (name, data) lumps.
+    fn build_wad(lumps: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"PWAD");
+        data.extend_from_slice(&(lumps.len() as u32).to_le_bytes());
+        let mut directory_offset = 12usize;
+        for (_, bytes) in lumps {
+            directory_offset += bytes.len();
+        }
+        data.extend_from_slice(&(directory_offset as u32).to_le_bytes());
+        let mut offset = 12usize;
+        let mut directory = Vec::new();
+        for (name, bytes) in lumps {
+            data.extend_from_slice(bytes);
+            directory.extend_from_slice(&(offset as u32).to_le_bytes());
+            directory.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            let mut name_bytes = [0u8; 8];
+            name_bytes[..name.len()].copy_from_slice(name.as_bytes());
+            directory.extend_from_slice(&name_bytes);
+            offset += bytes.len();
+        }
+        data.extend_from_slice(&directory);
+        data
+    }
+
+    /// One Hexen-format map whose LINEDEFS lump holds 7 records (112 bytes).
+    /// 112 is also divisible by 14, so size-only detection misparses it as
+    /// eight Doom records with shifted fields.
+    fn hexen_ambiguity_wad(with_behavior: bool) -> Vec<u8> {
+        let mut linedefs = Vec::new();
+        for record in 0..7u16 {
+            linedefs.extend_from_slice(&record.to_le_bytes());
+            linedefs.extend_from_slice(&((record + 1) % 2).to_le_bytes());
+            linedefs.extend_from_slice(&0u16.to_le_bytes()); // flags
+            linedefs.push(121); // special lives at byte 6 in Hexen records
+            linedefs.extend_from_slice(&[1, 2, 3, 4, 5]); // action args
+            linedefs.extend_from_slice(&0u16.to_le_bytes()); // right sidedef
+            linedefs.extend_from_slice(&0xFFFFu16.to_le_bytes()); // left = none
+        }
+        assert_eq!(linedefs.len(), 112);
+        let mut lumps: Vec<(&str, Vec<u8>)> = vec![
+            ("MAP01", Vec::new()),
+            ("THINGS", Vec::new()),
+            ("LINEDEFS", linedefs),
+            ("SIDEDEFS", vec![0; 30]),
+            ("VERTEXES", vec![0; 8]),
+            ("SECTORS", vec![0; 26]),
+        ];
+        if with_behavior {
+            lumps.push(("BEHAVIOR", vec![0; 4]));
+        }
+        build_wad(&lumps)
+    }
+
+    #[test]
+    fn behavior_lump_selects_hexen_format_over_size_divisibility() {
+        let bytes = hexen_ambiguity_wad(true);
+        let lumps = parse_lump_directory(&bytes).unwrap();
+        let map = parse_map_lumps(&bytes, &lumps, "MAP01").unwrap();
+        assert_eq!(map.linedefs.len(), 7, "BEHAVIOR must force 16-byte Hexen records");
+        assert_eq!(map.linedefs[0].special, 121);
+        assert_eq!(map.linedefs[0].left_sidedef, NO_SIDEDEF);
+    }
+
+    #[test]
+    fn without_behavior_the_divisibility_fallback_still_parses_doom() {
+        let bytes = hexen_ambiguity_wad(false);
+        let lumps = parse_lump_directory(&bytes).unwrap();
+        let map = parse_map_lumps(&bytes, &lumps, "MAP01").unwrap();
+        assert_eq!(map.linedefs.len(), 8, "no BEHAVIOR keeps the legacy Doom-first fallback");
+    }
+
+    #[test]
+    fn behavior_in_a_later_map_does_not_flip_earlier_doom_map() {
+        // MAP01 is Doom-format; MAP02 is a Hexen map carrying the BEHAVIOR
+        // lump. The marker-bounded section scan must keep them independent.
+        let lumps: Vec<(&str, Vec<u8>)> = vec![
+            ("MAP01", Vec::new()),
+            ("THINGS", Vec::new()),
+            ("LINEDEFS", vec![0; 28]), // 2 Doom records, not divisible by 16
+            ("SIDEDEFS", vec![0; 30]),
+            ("VERTEXES", vec![0; 8]),
+            ("SECTORS", vec![0; 26]),
+            ("MAP02", Vec::new()),
+            ("THINGS", Vec::new()),
+            ("LINEDEFS", vec![0; 112]), // ambiguous size
+            ("SIDEDEFS", vec![0; 30]),
+            ("VERTEXES", vec![0; 8]),
+            ("SECTORS", vec![0; 26]),
+            ("BEHAVIOR", vec![0; 4]),
+        ];
+        let bytes = build_wad(&lumps);
+        let directory = parse_lump_directory(&bytes).unwrap();
+        let map = parse_map_lumps(&bytes, &directory, "MAP01").unwrap();
+        assert_eq!(map.linedefs.len(), 2, "MAP01 must stay Doom despite MAP02's BEHAVIOR");
+        let map2 = parse_map_lumps(&bytes, &directory, "MAP02").unwrap();
+        assert_eq!(map2.linedefs.len(), 7, "MAP02's own BEHAVIOR selects Hexen");
+    }
 }
 
 #[cfg(test)]
