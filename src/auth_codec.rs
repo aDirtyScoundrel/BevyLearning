@@ -224,11 +224,15 @@ pub fn decode_input_packet(
     let session_token = u128::from_le_bytes(data[6..22].try_into().ok()?);
     let input_sequence = u32::from_le_bytes(data[22..26].try_into().ok()?);
     let payload_len = u32::from_le_bytes(data[26..30].try_into().ok()?) as usize;
-    if data.len() < 30 + payload_len {
+    // Exact length: trailing bytes after the declared payload are a protocol
+    // violation, and the addition must not wrap on 32-bit targets before the
+    // bounds comparison.
+    let expected_len = payload_len.checked_add(30)?;
+    if data.len() != expected_len {
         return None;
     }
 
-    Some((session_token, input_sequence, data[30..30 + payload_len].to_vec()))
+    Some((session_token, input_sequence, data[30..expected_len].to_vec()))
 }
 
 pub fn encode_snapshot_packet(magic: [u8; 4], version: u8, states: &[(u64, Transform, Color)]) -> Vec<u8> {
@@ -370,6 +374,21 @@ mod tests {
         assert_eq!(decoded[1].0, 2);
         assert!((decoded[0].1.translation.x - 1.0).abs() < 0.0001);
         assert!((decoded[1].1.translation.z - 4.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn input_packet_rejects_trailing_bytes_and_huge_lengths() {
+        let payload = encode_input_payload(0.5, -0.25, true, Color::srgb(0.2, 0.4, 0.6));
+        let mut encoded = encode_input_packet(TEST_MAGIC, TEST_VERSION, 88, 5, &payload);
+        // Control: the exact packet decodes.
+        assert!(decode_input_packet(TEST_MAGIC, TEST_VERSION, &encoded).is_some());
+        // Trailing bytes after the declared payload are rejected.
+        encoded.push(0);
+        assert_eq!(decode_input_packet(TEST_MAGIC, TEST_VERSION, &encoded), None);
+        // A length field near u32::MAX must not wrap the bounds check.
+        let mut crafted = encode_input_packet(TEST_MAGIC, TEST_VERSION, 88, 5, &payload);
+        crafted[26..30].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(decode_input_packet(TEST_MAGIC, TEST_VERSION, &crafted), None);
     }
 
     #[test]

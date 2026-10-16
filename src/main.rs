@@ -101,10 +101,14 @@ fn capture_app_exit(
 
 /// Enter the game when the launch selects a multiplayer connection.
 fn multiplayer_launch_requested(mut get: impl FnMut(&str) -> Option<String>) -> bool {
-    get("CUBE_AUTH_SERVER_ADDR").is_some()
+    // An empty or blank value is a misconfiguration, not a join target.
+    // Treating it as present would skip the menu into an InGame state with
+    // nothing to connect to.
+    let present = |value: Option<String>| value.is_some_and(|value| !value.trim().is_empty());
+    present(get("CUBE_AUTH_SERVER_ADDR"))
         || get("STEAM_AUTH_HOST").is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        || get("STEAM_AUTH_HOST_ID").is_some()
-        || get("STEAM_REMOTE_IDS").is_some_and(|value| !value.trim().is_empty())
+        || present(get("STEAM_AUTH_HOST_ID"))
+        || present(get("STEAM_REMOTE_IDS"))
 }
 
 fn skip_menu_for_existing_join_target(mut next_state: ResMut<NextState<AppState>>) {
@@ -128,6 +132,9 @@ mod launch_tests {
             ("STEAM_AUTH_HOST_ID", "123", true),
             ("STEAM_REMOTE_IDS", "123,456", true),
             ("STEAM_REMOTE_IDS", "", false),
+            ("CUBE_AUTH_SERVER_ADDR", "", false),
+            ("CUBE_AUTH_SERVER_ADDR", "   ", false),
+            ("STEAM_AUTH_HOST_ID", "", false),
         ] {
             assert_eq!(multiplayer_launch_requested(|key| (key == name).then(|| value.to_owned())), expected, "{name}={value}");
         }

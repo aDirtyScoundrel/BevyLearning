@@ -162,12 +162,13 @@ struct LinedefSpecial {
 }
 
 /// Decodes a linedef's numeric `special` field into structured metadata.
-/// Currently only recognizes the vanilla door specials (needed for door
-/// spawning + future keycard gating); other categories return `None` today
-/// and fall through to the existing geometry-based door-candidate fallback
-/// so already-working maps don't regress while the dispatch table grows.
-/// Extend this match arm-by-arm as docs/CLASSIC_MAP_SUPPORT.md items 2, 5,
-/// and 6 land — do not replace it with a heuristic again.
+/// The table covers door, floor, stair, lift, exit, teleport, and light
+/// specials. Door spawning requires `SpecialCategory::Door` (see
+/// `is_door_special`); unsupported or unknown specials stay inert. The old
+/// geometry-based door-candidate fallback is gone — do not reintroduce a
+/// heuristic. Extend this match arm-by-arm as docs/CLASSIC_MAP_SUPPORT.md
+/// items 2, 5, and 6 land; toggle specials 4/5 are still absent, tracked in
+/// docs/CLASSIC_MAP_PROGRESS.md.
 fn decode_linedef_special(special: u16) -> Option<LinedefSpecial> {
     use ActivationKind::*;
     use SpecialCategory::*;
@@ -2239,6 +2240,19 @@ fn infer_map_name_from_textmap_path(entry_name: &str) -> Option<String> {
     }
 }
 
+/// UDMF permits doubles beyond the classic i16 storage. Saturating them
+/// would silently collapse geometry — vertices can clamp onto one point and
+/// then fail meshing — so reject out-of-range values and name the block.
+fn udmf_i16(value: f32, block: &str, field: &str) -> Result<i16, String> {
+    let rounded = value.round();
+    if !rounded.is_finite() || rounded < i16::MIN as f32 || rounded > i16::MAX as f32 {
+        return Err(format!(
+            "UDMF {block} field {field} value {value} is outside the classic i16 range"
+        ));
+    }
+    Ok(rounded as i16)
+}
+
 fn parse_udmf_textmap(text: &str) -> Result<ParsedMap, String> {
     let stripped = strip_udmf_comments(text);
     let mut map = ParsedMap {
@@ -2256,8 +2270,8 @@ fn parse_udmf_textmap(text: &str) -> Result<ParsedMap, String> {
                 let x = parse_udmf_f32(&block_body, "x").unwrap_or(0.0);
                 let y = parse_udmf_f32(&block_body, "y").unwrap_or(0.0);
                 map.vertices.push(Vertex {
-                    x: x.round() as i16,
-                    y: y.round() as i16,
+                    x: udmf_i16(x, "vertex", "x")?,
+                    y: udmf_i16(y, "vertex", "y")?,
                 });
             }
             "linedef" => {
@@ -2295,8 +2309,16 @@ fn parse_udmf_textmap(text: &str) -> Result<ParsedMap, String> {
                 });
             }
             "sector" => {
-                let floor_height = parse_udmf_f32(&block_body, "heightfloor").unwrap_or(0.0).round() as i16;
-                let ceiling_height = parse_udmf_f32(&block_body, "heightceiling").unwrap_or(128.0).round() as i16;
+                let floor_height = udmf_i16(
+                    parse_udmf_f32(&block_body, "heightfloor").unwrap_or(0.0),
+                    "sector",
+                    "heightfloor",
+                )?;
+                let ceiling_height = udmf_i16(
+                    parse_udmf_f32(&block_body, "heightceiling").unwrap_or(128.0),
+                    "sector",
+                    "heightceiling",
+                )?;
                 let floor_texture = parse_udmf_string(&block_body, "texturefloor")
                     .unwrap_or_else(|| "FLOOR".to_string())
                     .to_ascii_uppercase();
@@ -2316,9 +2338,9 @@ fn parse_udmf_textmap(text: &str) -> Result<ParsedMap, String> {
                 let angle = parse_udmf_f32(&block_body, "angle").unwrap_or(0.0);
                 let kind = parse_udmf_u16(&block_body, "type").unwrap_or(0);
                 map.things.push(Thing {
-                    x: x.round() as i16,
-                    y: y.round() as i16,
-                    angle_deg: angle.round() as i16,
+                    x: udmf_i16(x, "thing", "x")?,
+                    y: udmf_i16(y, "thing", "y")?,
+                    angle_deg: udmf_i16(angle, "thing", "angle")?,
                     kind,
                 });
             }
@@ -2614,6 +2636,19 @@ fn check_statement<'a>(statement: &'a str, key: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod udmf_regression_tests {
     use super::*;
+
+    #[test]
+    fn out_of_range_values_reject_instead_of_saturating() {
+        let text = "vertex { x = 40000.0; y = 0.0; }\nvertex { x = 0.0; y = 0.0; }\nlinedef { v1 = 0; v2 = 1; }\n";
+        let error = parse_udmf_textmap(text).unwrap_err();
+        assert!(error.contains("vertex"), "{error}");
+        assert!(error.contains("40000"), "{error}");
+        let sector = "vertex { x = 0.0; y = 0.0; }\nvertex { x = 1.0; y = 1.0; }\nlinedef { v1 = 0; v2 = 1; }\nsector { heightfloor = -99999.0; }\n";
+        assert!(parse_udmf_textmap(sector).unwrap_err().contains("heightfloor"));
+        // Classic-range values still load, including the exact i16 bounds.
+        let ok = "vertex { x = 32767.0; y = -32768.0; }\nvertex { x = 0.0; y = 0.0; }\nlinedef { v1 = 0; v2 = 1; }\n";
+        assert!(parse_udmf_textmap(ok).is_ok());
+    }
     const GEOMETRY: &str = r#"
 vertex { x = 16; y = -8; }
 vertex { x = 128; y = 64; }
