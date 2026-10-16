@@ -1,7 +1,7 @@
 use std::io::{Cursor, Read};
 use std::path::Path;
 
-use bevy::math::primitives::{Cuboid, Plane3d};
+use bevy::math::primitives::Cuboid;
 use bevy::mesh::Mesh3d;
 use bevy::pbr::{MeshMaterial3d, StandardMaterial};
 use bevy::prelude::*;
@@ -18,11 +18,10 @@ const COLLISION_DEBUG_THICKNESS: f32 = 0.04;
 const DOOR_OPEN_SPEED: f32 = 1.8;
 const DOOR_HOLD_SECS: f32 = 2.0;
 const DOOR_TRIGGER_DISTANCE: f32 = 1.7;
-const DOOR_COLLISION_OPEN_THRESHOLD: f32 = 0.88;
+pub(crate) const DOOR_COLLISION_OPEN_THRESHOLD: f32 = 0.88;
 const MIN_DOOR_SCALE_Y: f32 = 0.04;
 const MAX_TRAVERSABLE_STEP_HEIGHT: f32 = 0.50;
-const DOOR_THIN_SECTOR_HEIGHT: f32 = 0.22;
-const DOOR_TALL_NEIGHBOR_HEIGHT: f32 = 1.10;
+
 /// Maximum bytes we'll read from a single archive entry (embedded WAD,
 /// nested PK3/zip, or UDMF TEXTMAP) before giving up. WAD/PK3 files are
 /// untrusted user-supplied content; without this cap a crafted archive
@@ -311,9 +310,275 @@ pub struct WadCollisionWorld {
     pub segments: Vec<WallCollisionSegment>,
     pub doors: Vec<WadDoor>,
     pub push_radius: f32,
+    pub sectors: Vec<WadSectorRegion>,
+    pub player_spawns: Vec<Transform>,
+}
+
+
+#[derive(Debug, Clone)]
+pub struct WadSectorRegion {
+    pub edges: Vec<WallCollisionSegment>,
+    pub floor: f32,
+    pub ceiling: f32,
+}
+
+impl WadSectorRegion {
+    pub fn contains(&self, point: Vec2) -> bool {
+        if !point.is_finite() {
+            return false;
+        }
+
+        let mut inside = false;
+        for edge in &self.edges {
+            let p1 = edge.start;
+            let p2 = edge.end;
+
+            if !p1.is_finite() || !p2.is_finite() {
+                continue;
+            }
+
+            if (p1.y > point.y) != (p2.y > point.y) {
+                let x_intersect = p1.x + (point.y - p1.y) * (p2.x - p1.x) / (p2.y - p1.y);
+                if point.x < x_intersect {
+                    inside = !inside;
+                }
+            }
+        }
+        inside
+    }
+}
+
+fn sector_regions(map: &ParsedMap, center: Vec2) -> Vec<WadSectorRegion> {
+    let mut regions: Vec<WadSectorRegion> = map.sectors.iter().map(|s| WadSectorRegion {
+        edges: Vec::new(),
+        floor: s.floor_height as f32 * DOOM_TO_WORLD_SCALE,
+        ceiling: s.ceiling_height as f32 * DOOM_TO_WORLD_SCALE,
+    }).collect();
+
+    for linedef in &map.linedefs {
+        let v1_idx = linedef.start_vertex as usize;
+        let v2_idx = linedef.end_vertex as usize;
+
+        let v1 = match map.vertices.get(v1_idx) {
+            Some(v) => v,
+            None => continue,
+        };
+        let v2 = match map.vertices.get(v2_idx) {
+            Some(v) => v,
+            None => continue,
+        };
+
+        let right_sector_idx = if linedef.right_sidedef != NO_SIDEDEF {
+            match map.sidedefs.get(linedef.right_sidedef as usize) {
+                Some(sd) => Some(sd.sector as usize),
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        let left_sector_idx = if linedef.left_sidedef != NO_SIDEDEF {
+            match map.sidedefs.get(linedef.left_sidedef as usize) {
+                Some(sd) => Some(sd.sector as usize),
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        if let (Some(r), Some(l)) = (right_sector_idx, left_sector_idx) {
+            if r == l {
+                continue;
+            }
+        }
+
+        let p1 = doom_to_world(Vec2::new(v1.x as f32, v1.y as f32)) - center;
+        let p2 = doom_to_world(Vec2::new(v2.x as f32, v2.y as f32)) - center;
+        let segment = WallCollisionSegment { start: p1, end: p2 };
+
+        if let Some(idx) = right_sector_idx {
+            if idx < regions.len() {
+                regions[idx].edges.push(segment);
+            }
+        }
+
+        if let Some(idx) = left_sector_idx {
+            if idx < regions.len() {
+                regions[idx].edges.push(segment);
+            }
+        }
+    }
+
+    regions
+}
+#[cfg(test)]
+mod sector_region_tests {
+    use super::*;
+
+    #[test]
+    fn test_contains_unordered_rectangle() {
+        let edges = vec![
+            WallCollisionSegment { start: Vec2::new(0.0, 0.0), end: Vec2::new(10.0, 0.0) },
+            WallCollisionSegment { start: Vec2::new(10.0, 0.0), end: Vec2::new(10.0, 10.0) },
+            WallCollisionSegment { start: Vec2::new(10.0, 10.0), end: Vec2::new(0.0, 10.0) },
+            WallCollisionSegment { start: Vec2::new(0.0, 10.0), end: Vec2::new(0.0, 0.0) },
+        ];
+        let mut edges = edges;
+        edges.swap(0, 2);
+        let region = WadSectorRegion { edges, floor: 0.0, ceiling: 10.0 };
+        assert!(region.contains(Vec2::new(5.0, 5.0)));
+        assert!(!region.contains(Vec2::new(-1.0, 5.0)));
+    }
+
+    #[test]
+    fn test_contains_concave_outline() {
+
+        let edges = vec![
+            WallCollisionSegment { start: Vec2::new(0.0, 0.0), end: Vec2::new(10.0, 0.0) },
+            WallCollisionSegment { start: Vec2::new(10.0, 0.0), end: Vec2::new(10.0, 5.0) },
+            WallCollisionSegment { start: Vec2::new(10.0, 5.0), end: Vec2::new(5.0, 5.0) },
+            WallCollisionSegment { start: Vec2::new(5.0, 5.0), end: Vec2::new(5.0, 10.0) },
+            WallCollisionSegment { start: Vec2::new(5.0, 10.0), end: Vec2::new(0.0, 10.0) },
+            WallCollisionSegment { start: Vec2::new(0.0, 10.0), end: Vec2::new(0.0, 0.0) },
+        ];
+        let mut edges = edges;
+        edges.swap(0, 2);
+        let region = WadSectorRegion { edges, floor: 0.0, ceiling: 10.0 };
+        assert!(region.contains(Vec2::new(2.0, 2.0)));
+        assert!(!region.contains(Vec2::new(7.0, 7.0)));
+    }
+
+    #[test]
+    fn test_contains_inner_hole() {
+
+        let edges = vec![
+
+            WallCollisionSegment { start: Vec2::new(0.0, 0.0), end: Vec2::new(10.0, 0.0) },
+            WallCollisionSegment { start: Vec2::new(10.0, 0.0), end: Vec2::new(10.0, 10.0) },
+            WallCollisionSegment { start: Vec2::new(10.0, 10.0), end: Vec2::new(0.0, 10.0) },
+            WallCollisionSegment { start: Vec2::new(0.0, 10.0), end: Vec2::new(0.0, 0.0) },
+
+            WallCollisionSegment { start: Vec2::new(3.0, 3.0), end: Vec2::new(7.0, 3.0) },
+            WallCollisionSegment { start: Vec2::new(7.0, 3.0), end: Vec2::new(7.0, 7.0) },
+            WallCollisionSegment { start: Vec2::new(7.0, 7.0), end: Vec2::new(3.0, 7.0) },
+            WallCollisionSegment { start: Vec2::new(3.0, 7.0), end: Vec2::new(3.0, 3.0) },
+        ];
+        let mut edges = edges;
+        edges.swap(0, 2);
+        let region = WadSectorRegion { edges, floor: 0.0, ceiling: 10.0 };
+        assert!(region.contains(Vec2::new(1.0, 1.0)));
+        assert!(!region.contains(Vec2::new(5.0, 5.0)));
+    }
+
+    #[test]
+    fn test_contains_non_finite() {
+        let edges = vec![
+            WallCollisionSegment { start: Vec2::new(0.0, 0.0), end: Vec2::new(10.0, 0.0) },
+            WallCollisionSegment { start: Vec2::new(10.0, 0.0), end: Vec2::new(10.0, 10.0) },
+            WallCollisionSegment { start: Vec2::new(10.0, 10.0), end: Vec2::new(0.0, 10.0) },
+            WallCollisionSegment { start: Vec2::new(0.0, 10.0), end: Vec2::new(0.0, 0.0) },
+        ];
+        let mut edges = edges;
+        edges.swap(0, 2);
+        let region = WadSectorRegion { edges, floor: 0.0, ceiling: 10.0 };
+        assert!(!region.contains(Vec2::new(f32::NAN, 5.0)));
+        assert!(!region.contains(Vec2::new(5.0, f32::INFINITY)));
+    }
+
+
+    #[test]
+    fn sector_boundaries_preserve_ownership_and_ignore_bad_references() {
+        let mut map = ParsedMap {
+            vertices: vec![Vertex { x: 0, y: 0 }, Vertex { x: 128, y: 0 }],
+            linedefs: vec![LineDef { start_vertex: 0, end_vertex: 1, special: 0, tag: 0, right_sidedef: 0, left_sidedef: 1 }],
+            sidedefs: (0..2).map(|_| SideDef { upper_texture: String::new(), lower_texture: String::new(), middle_texture: String::new(), sector: 0 }).collect(),
+            sectors: (0..2).map(|_| Sector { floor_height: 64, ceiling_height: 192, floor_texture: String::new(), ceiling_texture: String::new() }).collect(),
+            things: Vec::new(),
+        };
+        assert!(sector_regions(&map, Vec2::ZERO).iter().all(|s| s.edges.is_empty()));
+        map.sidedefs[1].sector = 1;
+        let regions = sector_regions(&map, Vec2::new(1.0,2.0));
+        assert_eq!(regions.len(), 2);
+        for region in &regions {
+            assert_eq!(region.edges.len(), 1);
+            assert_eq!(region.floor, 64.0 * DOOM_TO_WORLD_SCALE);
+            assert_eq!(region.ceiling, 192.0 * DOOM_TO_WORLD_SCALE);
+            assert_eq!(region.edges[0].start, Vec2::new(-1.0,-2.0));
+        }
+        map.linedefs[0].end_vertex = u16::MAX;
+        assert!(sector_regions(&map, Vec2::ZERO).iter().all(|s| s.edges.is_empty()));
+        map.linedefs[0].end_vertex = 1;
+        map.linedefs[0].left_sidedef = u16::MAX;
+        let regions = sector_regions(&map, Vec2::ZERO);
+        assert_eq!(regions[0].edges.len(), 1);
+        assert!(regions[1].edges.is_empty());
+        map.linedefs[0].right_sidedef = 999;
+        assert!(sector_regions(&map, Vec2::ZERO).iter().all(|s| s.edges.is_empty()));
+    }
 }
 
 impl WadCollisionWorld {
+    pub fn vertical_bounds(&self, position: Vec3) -> Option<(f32, f32)> {
+        let point = Vec2::new(position.x, position.z);
+        self.sectors.iter().find(|sector| sector.contains(point)).map(|sector| (sector.floor, sector.ceiling))
+    }
+
+    pub fn floor_height_at(&self, position: Vec3) -> f32 {
+        self.vertical_bounds(position).map_or(0.0, |bounds| bounds.0)
+    }
+
+    pub fn spawn_for_slot(&self, slot: usize) -> Option<Transform> {
+        self.player_spawns.get(slot % self.player_spawns.len().max(1)).copied()
+    }
+
+pub fn resolve_motion(&self, start: Vec3, end: Vec3) -> Vec3 {
+    if !start.is_finite() {
+        return Vec3::ZERO;
+    }
+    if !end.is_finite() {
+        return start;
+    }
+
+    let displacement = end - start;
+    if displacement.x == 0.0 && displacement.y == 0.0 && displacement.z == 0.0 {
+        return start;
+    }
+
+    let distance_sq = displacement.length_squared();
+    if !distance_sq.is_finite() {
+        return start;
+    }
+
+    let distance = distance_sq.sqrt();
+    if !distance.is_finite() {
+        return start;
+    }
+
+    let max_step = self.push_radius.max(0.01);
+    let substep_length = max_step * 0.5;
+
+    if distance > 256.0 * substep_length {
+        return start;
+    }
+
+    let num_substeps = (distance / substep_length).ceil() as usize;
+    let num_substeps = num_substeps.min(256);
+
+    if num_substeps == 0 {
+        return start;
+    }
+
+    let step_vec = displacement / num_substeps as f32;
+    let mut current = start;
+
+    for _ in 0..num_substeps {
+        let requested = current + step_vec;
+        current = self.resolve_position(requested);
+    }
+
+    current
+}
+
     pub fn resolve_position(&self, position: Vec3) -> Vec3 {
         if self.segments.is_empty() && self.doors.is_empty() {
             return position;
@@ -377,17 +642,172 @@ impl WadCollisionWorld {
     }
 }
 
+#[cfg(test)]
+mod motion_tests {
+    use super::*;
+
+    fn make_world() -> WadCollisionWorld {
+        WadCollisionWorld {
+            segments: vec![WallCollisionSegment {
+                start: Vec2::new(0.0, 0.0),
+                end: Vec2::new(0.0, 10.0),
+            }],
+            doors: vec![],
+            push_radius: 1.0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_cross_wall_from_left() {
+        let world = make_world();
+        let start = Vec3::new(-2.0, 0.0, 5.0);
+        let end = Vec3::new(2.0, 0.0, 5.0);
+        let result = world.resolve_motion(start, end);
+        assert!(result.x <= -world.push_radius, "Should not cross wall from left");
+    }
+
+    #[test]
+    fn test_cross_wall_from_right() {
+        let world = make_world();
+        let start = Vec3::new(2.0, 0.0, 5.0);
+        let end = Vec3::new(-2.0, 0.0, 5.0);
+        let result = world.resolve_motion(start, end);
+        assert!(result.x >= world.push_radius, "Should not cross wall from right");
+    }
+
+    #[test]
+    fn test_move_parallel_to_wall() {
+        let world = make_world();
+        let start = Vec3::new(2.0, 0.0, 0.0);
+        let end = Vec3::new(2.0, 0.0, 10.0);
+        let result = world.resolve_motion(start, end);
+        assert!((result.x - 2.0).abs() < 0.1, "Should move parallel without deviation");
+        assert!((result.z - 10.0).abs() < 0.1, "Should reach end z");
+    }
+
+    #[test]
+    fn test_unobstructed_movement() {
+        let world = make_world();
+        let start = Vec3::new(5.0, 0.0, 5.0);
+        let end = Vec3::new(6.0, 0.0, 5.0);
+        let result = world.resolve_motion(start, end);
+        assert!((result.x - 6.0).abs() < 0.01, "Should reach end x");
+        assert!((result.z - 5.0).abs() < 0.01, "Should reach end z");
+    }
+
+    #[test]
+    fn test_zero_motion() {
+        let world = make_world();
+        let start = Vec3::new(5.0, 0.0, 5.0);
+        let end = Vec3::new(5.0, 0.0, 5.0);
+        let result = world.resolve_motion(start, end);
+        assert_eq!(result, start);
+    }
+
+    #[test]
+    fn test_excessive_motion() {
+        let world = make_world();
+        let start = Vec3::new(0.0, 0.0, 0.0);
+        let end = Vec3::new(10000.0, 0.0, 0.0);
+        let result = world.resolve_motion(start, end);
+        assert_eq!(result, start, "Should reject excessive motion");
+    }
+
+    #[test]
+    fn test_non_finite_input_start() {
+        let world = make_world();
+        let start = Vec3::new(f32::NAN, 0.0, 0.0);
+        let end = Vec3::new(1.0, 0.0, 0.0);
+        let result = world.resolve_motion(start, end);
+        assert_eq!(result, Vec3::ZERO, "Should return ZERO for non-finite start");
+    }
+
+    #[test]
+    fn test_non_finite_input_end() {
+        let world = make_world();
+        let start = Vec3::new(0.0, 0.0, 0.0);
+        let end = Vec3::new(f32::INFINITY, 0.0, 0.0);
+        let result = world.resolve_motion(start, end);
+        assert_eq!(result, start, "Should return start for non-finite end");
+    }
+
+    #[test]
+    fn test_closed_door_blocks() {
+        let mut world = make_world();
+        world.segments.clear();
+        world.doors.push(WadDoor {
+            entity: Entity::PLACEHOLDER,
+            debug_entity: Entity::PLACEHOLDER,
+            start: Vec2::new(0.0, 0.0),
+            end: Vec2::new(0.0, 10.0),
+            bottom: 0.0,
+            closed_height: 1.0,
+            open_amount: 0.0,
+            hold_timer_secs: 0.0,
+            required_key: None,
+        });
+        let start = Vec3::new(-2.0, 0.0, 5.0);
+        let end = Vec3::new(2.0, 0.0, 5.0);
+        let result = world.resolve_motion(start, end);
+        assert!(result.x <= -world.push_radius, "Closed door should block crossing");
+    }
+
+    #[test]
+    fn test_open_door_permits() {
+        let mut world = make_world();
+        world.segments.clear();
+        world.doors.push(WadDoor {
+            entity: Entity::PLACEHOLDER,
+            debug_entity: Entity::PLACEHOLDER,
+            start: Vec2::new(0.0, 0.0),
+            end: Vec2::new(0.0, 10.0),
+            bottom: 0.0,
+            closed_height: 1.0,
+            open_amount: 1.0,
+            hold_timer_secs: 0.0,
+            required_key: None,
+        });
+        let start = Vec3::new(-2.0, 0.0, 5.0);
+        let end = Vec3::new(2.0, 0.0, 5.0);
+        let result = world.resolve_motion(start, end);
+        assert!((result.x - 2.0).abs() < 0.1, "Open door should permit crossing");
+    }
+}
+fn spawn_headless_level(commands: &mut Commands, path: &str, name: &str) -> Result<LoadedLevel, String> {
+    let mut meshes = Assets::<Mesh>::default();
+    let mut materials = Assets::<StandardMaterial>::default();
+    try_spawn_level_from_selection(commands, &mut meshes, &mut materials, None, path, name)
+}
+
+pub fn setup_headless_level(
+    mut commands: Commands,
+    mut ergo: ResMut<crate::config::HumanErgoConfig>,
+    mut exit: MessageWriter<bevy::app::AppExit>,
+) {
+    let Ok(path) = std::env::var("DOOM_WAD") else { return; };
+    let name = std::env::var("DOOM_MAP").unwrap_or_else(|_| "MAP01".to_owned());
+    match spawn_headless_level(&mut commands, &path, &name) {
+        Ok(level) => ergo.movement.plane_limit = level.info.suggested_plane_limit,
+        Err(error) => {
+            eprintln!("[server] Cannot load the selected map: {error}");
+            exit.write(bevy::app::AppExit::error());
+        }
+    }
+}
+
 pub fn spawn_level_from_env(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
+    images: Option<&mut Assets<Image>>,
 ) -> Option<LevelSpawnInfo> {
     let Some(wad_path) = std::env::var("DOOM_WAD").ok() else {
         commands.remove_resource::<WadCollisionWorld>();
         return None;
     };
     let map_name = std::env::var("DOOM_MAP").unwrap_or_else(|_| "MAP01".to_string());
-    spawn_level_from_selection(commands, meshes, materials, &wad_path, &map_name)
+    spawn_level_from_selection(commands, meshes, materials, images, &wad_path, &map_name)
 }
 
 pub fn update_wad_doors(
@@ -467,10 +887,11 @@ pub fn spawn_level_from_selection(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
+    images: Option<&mut Assets<Image>>,
     wad_path: &str,
     map_name: &str,
 ) -> Option<LevelSpawnInfo> {
-    match try_spawn_level_from_selection(commands, meshes, materials, wad_path, map_name) {
+    match try_spawn_level_from_selection(commands, meshes, materials, images, wad_path, map_name) {
         Ok(loaded) => Some(loaded.info),
         Err(error) => {
             println!(
@@ -486,10 +907,11 @@ pub fn try_spawn_level_from_selection(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
+    images: Option<&mut Assets<Image>>,
     wad_path: &str,
     map_name: &str,
 ) -> Result<LoadedLevel, String> {
-    match spawn_level_from_wad(commands, meshes, materials, wad_path, map_name) {
+    match spawn_level_from_wad(commands, meshes, materials, images, wad_path, map_name) {
         Ok((info, collision_world, resolved_map_name, source_label)) => {
             commands.insert_resource(collision_world);
             println!("[wad] loaded map {} from {}", resolved_map_name, source_label);
@@ -506,18 +928,119 @@ pub fn try_spawn_level_from_selection(
     }
 }
 
+/// Prepare every sector surface before the loader creates any entities.
+fn prepare_sector_surfaces(
+    map: &ParsedMap, regions: &[WadSectorRegion], center: Vec2,
+) -> Result<Vec<(Mesh, String)>, String> {
+    const MAX_MAP_SCAN_WORK: usize = 16_000_000;
+    const MAX_MAP_SURFACE_VERTICES: usize = 1_500_000;
+    if map.sectors.len() != regions.len() {
+        return Err("Sector geometry does not match the map".into());
+    }
+    let mut surfaces = Vec::new();
+    let mut scan_work = 0usize;
+    let mut vertex_count = 0usize;
+    for (index, (sector, region)) in map.sectors.iter().zip(regions).enumerate() {
+        let work = region.edges.len().checked_mul(region.edges.len()).and_then(|v| v.checked_mul(2));
+        scan_work = work.and_then(|v| scan_work.checked_add(v))
+            .filter(|v| *v <= MAX_MAP_SCAN_WORK)
+            .ok_or_else(|| "Map exceeds the surface scan limit".to_owned())?;
+        let edges: Vec<_> = region.edges.iter().map(|edge| (edge.start, edge.end)).collect();
+        for (height, ceiling, texture) in [
+            (region.floor, false, &sector.floor_texture),
+            (region.ceiling, true, &sector.ceiling_texture),
+        ] {
+            // A sky flat exposes the sky rather than an opaque plane.
+            if texture.eq_ignore_ascii_case("F_SKY1") { continue; }
+            // One unmeshable sector (open or self-crossing boundary) loses
+            // only its own surface; the map keeps loading and the sector
+            // keeps its collision region.
+            let mesh = match crate::map_surfaces::horizontal_mesh(
+                &edges, height, ceiling, center, 64.0 * DOOM_TO_WORLD_SCALE,
+            ) {
+                Ok(mesh) => mesh,
+                Err(error) => {
+                    warn!("[wad] Cannot mesh sector {index}: {error}. The surface is skipped.");
+                    continue;
+                }
+            };
+            let count = mesh.count_vertices();
+            vertex_count = vertex_count.checked_add(count)
+                .filter(|v| *v <= MAX_MAP_SURFACE_VERTICES)
+                .ok_or_else(|| "Map exceeds the surface vertex limit".to_owned())?;
+            if count > 0 { surfaces.push((mesh, clean_texture_name(texture))); }
+        }
+    }
+    Ok(surfaces)
+}
+
+fn prepare_flat_images(
+    wad_bytes: &[u8],
+    lumps: &[LumpEntry],
+    requested: &std::collections::BTreeSet<String>,
+) -> Result<std::collections::BTreeMap<String, Image>, String> {
+    // Limit decoded RGBA pixels to 32 MiB per level.
+    if requested.len() > 2048 || lumps.len() > crate::doom_flats::MAX_LUMP_NAMES {
+        return Err("WAD exceeds the flat texture budget".into());
+    }
+    let mut decoded = std::collections::BTreeMap::new();
+    let Some(palette) = lumps.iter().rev().find(|entry| entry.name == "PLAYPAL") else {
+        warn!("[wad] No PLAYPAL in this WAD. Flat textures use placeholders.");
+        return Ok(decoded);
+    };
+    let bytes = |entry: &LumpEntry| -> Result<&[u8], String> {
+        entry.offset.checked_add(entry.size)
+            .and_then(|end| wad_bytes.get(entry.offset..end))
+            .ok_or_else(|| "Flat resource range exceeds the WAD".to_owned())
+    };
+    // A damaged palette degrades every flat at once, so fall back to
+    // placeholders in one step instead of failing the whole map.
+    let Ok(palette) = bytes(palette) else {
+        warn!("[wad] PLAYPAL lies outside the WAD data. Flat textures use placeholders.");
+        return Ok(decoded);
+    };
+    if palette.len() < 768 {
+        warn!("[wad] PLAYPAL is shorter than 768 bytes. Flat textures use placeholders.");
+        return Ok(decoded);
+    }
+    let names: Vec<_> = lumps.iter().map(|entry| entry.name.as_str()).collect();
+    let flat_indices = crate::doom_flats::flat_indices(&names)?;
+    for name in requested {
+        let Some(entry) = flat_indices.get(name).and_then(|index| lumps.get(*index)) else {
+            warn!("[wad] Flat {name} is missing from this WAD. It uses a placeholder.");
+            continue;
+        };
+        // One damaged flat must not reject the whole map. Warn and fall back
+        // to the placeholder, matching the missing-flat convention above.
+        let Ok(raw) = bytes(entry) else {
+            warn!("[wad] Flat {name} lies outside the WAD data. It uses a placeholder.");
+            continue;
+        };
+        match crate::doom_flats::flat_image(raw, palette) {
+            Ok(image) => {
+                decoded.insert(name.clone(), image);
+            }
+            Err(error) => warn!("[wad] Cannot decode flat {name}: {error}. It uses a placeholder."),
+        }
+    }
+    info!("[wad] flat textures: {}/{} decoded (static, base palette)", decoded.len(), requested.len());
+    Ok(decoded)
+}
+
 fn spawn_level_from_wad(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
+    images: Option<&mut Assets<Image>>,
     wad_path: &str,
     map_name: &str,
 ) -> Result<(LevelSpawnInfo, WadCollisionWorld, String, String), String> {
     let map_source = load_map_source(wad_path, map_name)?;
+    let mut source_lumps = Vec::new();
     let map = match &map_source.map_data {
         MapSourceData::ClassicWad(wad_bytes) => {
-            let lumps = parse_lump_directory(wad_bytes)?;
-            parse_map_lumps(wad_bytes, &lumps, &map_source.resolved_map_name)?
+            source_lumps = parse_lump_directory(wad_bytes)?;
+            parse_map_lumps(wad_bytes, &source_lumps, &map_source.resolved_map_name)?
         }
         MapSourceData::Udmf(map) => map.clone(),
     };
@@ -536,6 +1059,29 @@ fn spawn_level_from_wad(
     }
 
     let center = (min + max) * 0.5;
+    let sectors = sector_regions(&map, center);
+    let surfaces = prepare_sector_surfaces(&map, &sectors, center)?;
+    let mut flat_materials = std::collections::BTreeMap::new();
+    if let Some(images) = images {
+        if let MapSourceData::ClassicWad(bytes) = &map_source.map_data {
+            let requested = surfaces.iter().map(|(_, name)| name.clone()).collect();
+            let decoded = prepare_flat_images(bytes, &source_lumps, &requested)?;
+            for (name, image) in decoded {
+                let texture = images.add(image);
+                let material = materials.add(StandardMaterial {
+                    base_color: Color::WHITE,
+                    base_color_texture: Some(texture),
+                    perceptual_roughness: 1.0,
+                    // Sector COLORMAP lighting is not implemented yet.
+                    unlit: true,
+                    ..default()
+                });
+                flat_materials.insert(name, material);
+            }
+        } else {
+            warn!("[wad] UDMF external flat resources are not supported. Flats use placeholders.");
+        }
+    }
 
     let mut collision_segments = Vec::new();
     let mut doors = Vec::new();
@@ -576,8 +1122,7 @@ fn spawn_level_from_wad(
             let left_ceil = left_sector.ceiling_height as f32 * DOOM_TO_WORLD_SCALE;
 
             let decoded_special = decode_linedef_special(linedef.special);
-            let is_door = decoded_special.is_some()
-                || is_door_geometry_candidate(right_floor, right_ceil, left_floor, left_ceil, linedef.special);
+            let is_door = is_door_special(linedef.special);
 
             if is_door {
                 let bottom = right_floor.min(left_floor);
@@ -649,29 +1194,30 @@ fn spawn_level_from_wad(
         .max(extent.y)
         .max(MIN_FLOOR_HALF_EXTENT);
 
-    let floor_texture_name = map
-        .sectors
-        .first()
-        .map(|sector| clean_texture_name(&sector.floor_texture))
-        .unwrap_or("FLOOR".to_string());
-    let _ceiling_texture_name = map
-        .sectors
-        .first()
-        .map(|sector| clean_texture_name(&sector.ceiling_texture))
-        .unwrap_or("CEIL".to_string());
+    for (mesh, texture_name) in surfaces {
+        let material = flat_materials.get(&texture_name).cloned()
+            .unwrap_or_else(|| materials.add(texture_to_material(&texture_name)));
+        commands.spawn((
+            Mesh3d(meshes.add(mesh)),
+            MeshMaterial3d(material),
+            Transform::default(),
+            GlobalTransform::default(),
+            crate::scene::LevelGeometry,
+        ));
+    }
 
-    commands.spawn((
-        Mesh3d(meshes.add(Plane3d::new(Vec3::Y, Vec2::splat(floor_half_extent)).mesh().build())),
-        MeshMaterial3d(materials.add(texture_to_material(&floor_texture_name))),
-        Transform::default(),
-        GlobalTransform::default(),
-        crate::scene::LevelGeometry,
-    ));
+    let player_spawns = find_multiplayer_spawns(&map).iter().map(|spawn| {
+        let point = doom_to_world(Vec2::new(spawn.x as f32, spawn.y as f32)) - center;
+        let floor = sectors.iter().find(|sector| sector.contains(point)).map_or(0.0, |sector| sector.floor);
+        Transform::from_xyz(point.x, floor + crate::player::CUBE_REST_Y, point.y)
+            .with_rotation(Quat::from_rotation_y(doom_angle_to_yaw(spawn.angle_deg)))
+    }).collect();
 
     let (player_spawn, player_yaw) = find_player_spawn_for_slot(&map, 0)
         .map(|spawn| {
             let flat = doom_to_world(Vec2::new(spawn.x as f32, spawn.y as f32)) - center;
-            let spawn_pos = Vec3::new(flat.x, crate::player::CUBE_REST_Y, flat.y);
+            let floor = sectors.iter().find(|sector| sector.contains(flat)).map_or(0.0, |sector| sector.floor);
+            let spawn_pos = Vec3::new(flat.x, floor + crate::player::CUBE_REST_Y, flat.y);
             (spawn_pos, doom_angle_to_yaw(spawn.angle_deg))
         })
         .unwrap_or((Vec3::new(0.0, crate::player::CUBE_REST_Y, 0.0), 0.0));
@@ -688,6 +1234,8 @@ fn spawn_level_from_wad(
         segments: collision_segments,
         doors,
         push_radius: COLLISION_PADDING,
+        sectors,
+        player_spawns,
     };
 
     Ok((
@@ -1384,6 +1932,15 @@ fn parse_things(wad_bytes: &[u8], entry: &LumpEntry) -> Result<Vec<Thing>, Strin
 /// actually gets) is a server-authoritative decision, not decided here — see
 /// docs/CLASSIC_MAP_SUPPORT.md item 4. This function only surfaces what the
 /// map data contains.
+fn find_multiplayer_spawns(map: &ParsedMap) -> Vec<Thing> {
+    let mut starts: Vec<Thing> = map.things.iter().copied().filter(|thing| (1..=4).contains(&thing.kind)).collect();
+    starts.sort_by_key(|thing| thing.kind);
+    if starts.is_empty() {
+        starts.extend(map.things.iter().copied().filter(|thing| thing.kind == 11));
+    }
+    starts
+}
+
 fn find_player_spawns(map: &ParsedMap) -> Vec<Thing> {
     // Prefer the single-player start (type 1), then co-op starts (2-4),
     // then deathmatch starts (11) — vanilla Doom thing-type precedence.
@@ -1542,26 +2099,22 @@ fn spawn_door_panel(
         .id()
 }
 
-fn is_door_geometry_candidate(
-    right_floor: f32,
-    right_ceil: f32,
-    left_floor: f32,
-    left_ceil: f32,
-    special: u16,
-) -> bool {
-    if special == 0 {
-        return false;
+fn is_door_special(special: u16) -> bool {
+    decode_linedef_special(special).is_some_and(|decoded| decoded.category == SpecialCategory::Door)
+}
+
+#[cfg(test)]
+mod door_dispatch_tests {
+    use super::*;
+    #[test]
+    fn non_door_specials_do_not_spawn_door_panels() {
+        for special in [0, 5, 11, 12, 62] {
+            assert!(!is_door_special(special), "Special {special} must not create a door");
+        }
+        for special in [1, 26, 27, 28, 31, 117] {
+            assert!(is_door_special(special));
+        }
     }
-
-    let floor_diff = (right_floor - left_floor).abs();
-    let right_height = (right_ceil - right_floor).abs();
-    let left_height = (left_ceil - left_floor).abs();
-    let min_height = right_height.min(left_height);
-    let max_height = right_height.max(left_height);
-
-    floor_diff <= 0.24
-        && min_height <= DOOR_THIN_SECTOR_HEIGHT
-        && max_height >= DOOR_TALL_NEIGHBOR_HEIGHT
 }
 
 fn is_traversable_step(right_floor: f32, left_floor: f32) -> bool {
@@ -1774,35 +2327,59 @@ fn strip_udmf_comments(text: &str) -> String {
         let c = chars[index];
         let next = chars.get(index + 1).copied();
 
-        if c == '"' {
-            in_string = !in_string;
+        if in_string {
+            if c == '\\' {
+                // Handle escape sequence: copy backslash and next char
+                out.push(c);
+                if let Some(n) = next {
+                    out.push(n);
+                    index += 2;
+                    continue;
+                } else {
+                    index += 1;
+                    continue;
+                }
+            } else if c == '"' {
+                in_string = false;
+                out.push(c);
+                index += 1;
+                continue;
+            } else {
+                out.push(c);
+                index += 1;
+                continue;
+            }
+        } else {
+            if c == '"' {
+                in_string = true;
+                out.push(c);
+                index += 1;
+                continue;
+            }
+
+            if c == '/' && next == Some('/') {
+                index += 2;
+                while index < chars.len() && chars[index] != '\n' {
+                    index += 1;
+                }
+                continue;
+            }
+
+            if c == '/' && next == Some('*') {
+                index += 2;
+                while index + 1 < chars.len() {
+                    if chars[index] == '*' && chars[index + 1] == '/' {
+                        index += 2;
+                        break;
+                    }
+                    index += 1;
+                }
+                continue;
+            }
+
             out.push(c);
             index += 1;
-            continue;
         }
-
-        if !in_string && c == '/' && next == Some('/') {
-            index += 2;
-            while index < chars.len() && chars[index] != '\n' {
-                index += 1;
-            }
-            continue;
-        }
-
-        if !in_string && c == '/' && next == Some('*') {
-            index += 2;
-            while index + 1 < chars.len() {
-                if chars[index] == '*' && chars[index + 1] == '/' {
-                    index += 2;
-                    break;
-                }
-                index += 1;
-            }
-            continue;
-        }
-
-        out.push(c);
-        index += 1;
     }
 
     out
@@ -1812,45 +2389,101 @@ fn next_udmf_block(text: &str, start: usize) -> Option<(String, String, usize)> 
     let bytes = text.as_bytes();
     let mut i = start;
 
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    if i >= bytes.len() {
-        return None;
-    }
-
-    let name_start = i;
-    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-        i += 1;
-    }
-    if i == name_start {
-        return None;
-    }
-    let name = text[name_start..i].trim().to_ascii_lowercase();
-
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    if i >= bytes.len() || bytes[i] != b'{' {
-        return None;
-    }
-
-    i += 1;
-    let body_start = i;
-    let mut depth = 1usize;
     while i < bytes.len() {
-        match bytes[i] {
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    let body = text[body_start..i].to_string();
-                    return Some((name, body, i + 1));
-                }
-            }
-            _ => {}
+        // Skip whitespace
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
         }
-        i += 1;
+        if i >= bytes.len() {
+            return None;
+        }
+
+        // Try to parse an identifier
+        let name_start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+
+        if i == name_start {
+            // Not an identifier, skip this character to avoid infinite loop
+            i += 1;
+            continue;
+        }
+
+        let name = text[name_start..i].trim().to_ascii_lowercase();
+
+        // Skip whitespace after identifier
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+
+        if i >= bytes.len() {
+            return None;
+        }
+
+        if bytes[i] == b'{' {
+            // It's a block
+            i += 1;
+            let body_start = i;
+            let mut depth = 1usize;
+            let mut in_string = false;
+
+            while i < bytes.len() {
+                let c = bytes[i];
+                if in_string {
+                    if c == b'\\' {
+                        i += 2; // Skip escaped char
+                        continue;
+                    } else if c == b'"' {
+                        in_string = false;
+                    }
+                } else {
+                    if c == b'"' {
+                        in_string = true;
+                    } else if c == b'{' {
+                        depth += 1;
+                    } else if c == b'}' {
+                        depth -= 1;
+                        if depth == 0 {
+                            let body = text[body_start..i].to_string();
+                            return Some((name, body, i + 1));
+                        }
+                    }
+                }
+                i += 1;
+            }
+            // Unbalanced braces, return None
+            return None;
+        } else if bytes[i] == b'=' {
+            // It's a global assignment. Skip until semicolon, respecting strings.
+            i += 1; // skip '='
+            let mut in_string = false;
+            while i < bytes.len() {
+                let c = bytes[i];
+                if in_string {
+                    if c == b'\\' {
+                        i += 2;
+                        continue;
+                    } else if c == b'"' {
+                        in_string = false;
+                    }
+                } else {
+                    if c == b'"' {
+                        in_string = true;
+                    } else if c == b';' {
+                        i += 1; // skip ';'
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            // Continue loop to find next block
+            continue;
+        } else {
+            // Unknown token, skip it
+            i += 1;
+            continue;
+        }
     }
 
     None
@@ -1888,17 +2521,148 @@ fn parse_udmf_string(body: &str, key: &str) -> Option<String> {
 }
 
 fn extract_udmf_value<'a>(body: &'a str, key: &str) -> Option<&'a str> {
-    for statement in body.split(';') {
-        let statement = statement.trim();
-        if statement.is_empty() {
-            continue;
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    let mut in_string = false;
+    let mut statement_start = 0;
+
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            } else if c == b'"' {
+                in_string = false;
+            }
+        } else {
+            if c == b'"' {
+                in_string = true;
+            } else if c == b';' {
+                // End of statement
+                let statement = &body[statement_start..i];
+                if let Some(val) = check_statement(statement, key) {
+                    return Some(val);
+                }
+                statement_start = i + 1;
+            }
         }
-        let (lhs, rhs) = statement.split_once('=')?;
-        if lhs.trim().eq_ignore_ascii_case(key) {
-            return Some(rhs.trim());
+        i += 1;
+    }
+
+    // Check last statement
+    let statement = &body[statement_start..];
+    if let Some(val) = check_statement(statement, key) {
+        return Some(val);
+    }
+
+    None
+}
+
+fn check_statement<'a>(statement: &'a str, key: &str) -> Option<&'a str> {
+    let statement = statement.trim();
+    if statement.is_empty() {
+        return None;
+    }
+
+    // Find '=' outside of strings
+    let bytes = statement.as_bytes();
+    let mut in_string = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            } else if c == b'"' {
+                in_string = false;
+            }
+        } else {
+            if c == b'"' {
+                in_string = true;
+            } else if c == b'=' {
+                let lhs = &statement[..i];
+                let rhs = &statement[i+1..];
+                if lhs.trim().eq_ignore_ascii_case(key) {
+                    return Some(rhs.trim());
+                }
+                return None; // Key not found in this statement
+            }
         }
+        i += 1;
     }
     None
+}
+#[cfg(test)]
+mod udmf_regression_tests {
+    use super::*;
+    const GEOMETRY: &str = r#"
+vertex { x = 16; y = -8; }
+vertex { x = 128; y = 64; }
+linedef { v1 = 0; v2 = 1; sidefront = 0; }
+sidedef { sector = 0; texturemiddle = "STARTAN3"; }
+sector { heightfloor = 8; heightceiling = 144; }
+thing { x = 32; y = 48; type = 1; angle = 90; }
+"#;
+    fn check(text: &str) {
+        let map = parse_udmf_textmap(text).expect("The valid fixture must parse.");
+        assert_eq!(map.vertices.len(), 2);
+        assert_eq!((map.vertices[0].x, map.vertices[0].y), (16, -8));
+        assert_eq!((map.vertices[1].x, map.vertices[1].y), (128, 64));
+        assert_eq!(map.linedefs.len(), 1);
+        assert_eq!(map.linedefs[0].end_vertex, 1);
+        assert_eq!(map.sidedefs.len(), 1);
+        assert_eq!(map.sidedefs[0].middle_texture, "STARTAN3");
+        assert_eq!(map.sectors.len(), 1);
+        assert_eq!(map.sectors[0].ceiling_height, 144);
+        assert_eq!(map.things.len(), 1);
+        assert_eq!(map.things[0].kind, 1);
+    }
+    #[test]
+    fn bare_geometry_control() { check(GEOMETRY); }
+    #[test]
+    fn namespace_header() { check(&format!("namespace = \"Doom\";\n{GEOMETRY}")); }
+    #[test]
+    fn interleaved_assignment() {
+        check(&GEOMETRY.replace("linedef {", "user_scale = 1.5; linedef {"));
+    }
+    #[test]
+    fn global_quoted_delimiters() {
+        check(&format!(r#"user_note = "a; {{}} // /* literal */"; {GEOMETRY}"#));
+    }
+    #[test]
+    fn escaped_quote_before_comment_marker() {
+        check(&format!(r#"user_note = "quote \" // literal"; {GEOMETRY}"#));
+    }
+    #[test]
+    fn escaped_backslash_at_string_end() {
+        check(&format!(r#"user_path = "folder\\"; {GEOMETRY}"#));
+    }
+    #[test]
+    fn block_quoted_brace() {
+        check(&GEOMETRY.replace("vertex { x = 16;", "vertex { user_note = \"}\"; x = 16;"));
+    }
+    #[test]
+    fn block_quoted_semicolon() {
+        check(&GEOMETRY.replace("vertex { x = 16;", "vertex { user_note = \"alpha; beta\"; x = 16;"));
+    }
+    #[test]
+    fn comments_and_case() {
+        check(&format!("/* header */ NAMESPACE /* note */ = \"Doom\"; // header end\n{}", GEOMETRY.replace("vertex", "VeRtEx")));
+    }
+    #[test]
+    fn unknown_block_preserves_geometry() {
+        check(&format!(r#"user_extension {{ user_text = "{{;}}"; }} {GEOMETRY}"#));
+    }
+    #[test]
+    fn unicode_text_does_not_panic() {
+        check(&format!(r#"user_note = "café 地图"; {GEOMETRY}"#));
+    }
+    #[test]
+    fn missing_geometry_still_rejected() {
+        assert!(parse_udmf_textmap("namespace = \"Doom\";").is_err());
+    }
 }
 
 fn read_i32_le(bytes: &[u8], offset: usize) -> Result<i32, String> {
@@ -1943,6 +2707,381 @@ fn read_i16_le(bytes: &[u8], offset: usize) -> Result<i16, String> {
 #[cfg(test)]
 mod archive_cap_tests {
     use super::*;
+
+    #[test]
+    fn flat_resources_use_last_palette_and_ignore_outside_names() {
+        let mut bytes = vec![9; 768];
+        bytes.extend_from_slice(&vec![77; 768]);
+        bytes.extend_from_slice(&vec![0; 4096]);
+        let mut lumps = vec![
+            LumpEntry { offset: 0, size: 768, name: "PLAYPAL".into() },
+            LumpEntry { offset: 768, size: 768, name: "PLAYPAL".into() },
+            LumpEntry { offset: 0, size: 0, name: "F_START".into() },
+            LumpEntry { offset: 1536, size: 4096, name: "A".into() },
+            LumpEntry { offset: 0, size: 0, name: "F_END".into() },
+            LumpEntry { offset: 0, size: 768, name: "A".into() },
+        ];
+        let requested = std::collections::BTreeSet::from(["A".to_owned(), "MISSING".to_owned()]);
+        let decoded = prepare_flat_images(&bytes, &lumps, &requested).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert!(decoded["A"].data.as_ref().unwrap().chunks_exact(4).all(|p| p == [77, 77, 77, 255]));
+        lumps[3].size = 4095;
+        let degraded = prepare_flat_images(&bytes, &lumps, &requested).unwrap();
+        assert!(degraded.is_empty(), "a damaged flat must degrade to a placeholder");
+        assert!(prepare_flat_images(&[], &[], &requested).unwrap().is_empty());
+    }
+
+    #[test]
+    fn flat_resources_enforce_decoded_budget_and_byte_bounds() {
+        let too_many = (0..2049).map(|n| format!("F{n:07}")).collect();
+        assert!(prepare_flat_images(&[], &[], &too_many).unwrap_err().contains("budget"));
+        let bad = [LumpEntry { offset: usize::MAX, size: 1, name: "PLAYPAL".into() }];
+        assert!(
+            prepare_flat_images(&[], &bad, &Default::default()).unwrap().is_empty(),
+            "an out-of-range PLAYPAL must degrade to placeholders"
+        );
+    }
+
+    #[test]
+    fn damaged_flat_directories_degrade_to_placeholders() {
+        // Non-ASCII lump names, an unclosed F_START, and one short flat lump
+        // must not reject the map; the healthy flat still decodes.
+        let mut bytes = vec![9; 768];
+        bytes.extend_from_slice(&vec![0; 4096]);
+        let lumps = vec![
+            LumpEntry { offset: 0, size: 768, name: "PLAYPAL".into() },
+            LumpEntry { offset: 0, size: 0, name: "F_START".into() },
+            LumpEntry { offset: 768, size: 4096, name: "GOOD".into() },
+            LumpEntry { offset: 768, size: 100, name: "SHORTY".into() },
+            LumpEntry { offset: 0, size: 0, name: "\u{FFFD}BAD".into() },
+        ];
+        let requested: std::collections::BTreeSet<String> =
+            ["GOOD".to_owned(), "SHORTY".to_owned()].into();
+        let decoded = prepare_flat_images(&bytes, &lumps, &requested).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert!(decoded["GOOD"].data.as_ref().unwrap().chunks_exact(4).all(|p| p == [9, 9, 9, 255]));
+    }
+
+    #[test]
+    fn unmeshable_sector_is_skipped_without_rejecting_the_map() {
+        // One sector with an open boundary must lose only its own surfaces;
+        // the healthy sector still meshes floor and ceiling.
+        let square = [
+            Vec2::new(-4.0, -4.0),
+            Vec2::new(4.0, -4.0),
+            Vec2::new(4.0, 4.0),
+            Vec2::new(-4.0, 4.0),
+        ];
+        let closed: Vec<_> = (0..4)
+            .map(|i| WallCollisionSegment { start: square[i], end: square[(i + 1) % 4] })
+            .collect();
+        let open = vec![WallCollisionSegment { start: Vec2::new(10.0, 10.0), end: Vec2::new(12.0, 10.0) }];
+        let map = ParsedMap {
+            vertices: Vec::new(),
+            linedefs: Vec::new(),
+            sidedefs: Vec::new(),
+            sectors: vec![
+                Sector { floor_height: 0, ceiling_height: 8, floor_texture: "FLATA".into(), ceiling_texture: "FLATB".into() },
+                Sector { floor_height: 0, ceiling_height: 8, floor_texture: "FLATC".into(), ceiling_texture: "FLATD".into() },
+            ],
+            things: Vec::new(),
+        };
+        let regions = vec![
+            WadSectorRegion { edges: closed, floor: 0.0, ceiling: 8.0 },
+            WadSectorRegion { edges: open, floor: 0.0, ceiling: 8.0 },
+        ];
+        let prepared = prepare_sector_surfaces(&map, &regions, Vec2::ZERO).unwrap();
+        let names: Vec<_> = prepared.iter().map(|(_, name)| name.as_str()).collect();
+        assert_eq!(names, vec!["FLATA", "FLATB"], "only the healthy sector surfaces survive");
+    }
+
+    #[test]
+    #[ignore = "Requires the Freedoom reference WADs in CHICKEN_REFERENCE_DIR"]
+    fn real_freedoom_flat_pixels_match_source_palette() {
+        let root = std::path::PathBuf::from(std::env::var("CHICKEN_REFERENCE_DIR").unwrap());
+        let mut checked = 0;
+        for (file, count) in [("freedoom1.wad", 36), ("freedoom2.wad", 32)] {
+            let bytes = std::fs::read(root.join(file)).unwrap();
+            let lumps = parse_lump_directory(&bytes).unwrap();
+            let palette_entry = lumps.iter().rev().find(|l| l.name == "PLAYPAL").unwrap();
+            let palette = &bytes[palette_entry.offset..palette_entry.offset + 768];
+            let maps = find_map_markers(&lumps);
+            assert_eq!(maps.len(), count);
+            for name in maps {
+                let map = parse_map_lumps(&bytes, &lumps, &name).unwrap();
+                let requested: std::collections::BTreeSet<_> = map.sectors.iter()
+                    .flat_map(|s| [&s.floor_texture, &s.ceiling_texture])
+                    .map(|s| clean_texture_name(s)).filter(|s| s != "F_SKY1").collect();
+                let images = prepare_flat_images(&bytes, &lumps, &requested).unwrap();
+                assert_eq!(images.len(), requested.len(), "Missing flat in {file}:{name}");
+                for (flat, image) in &images {
+                    // Compare every pixel with source bytes, without the decoder or namespace helper.
+                    let entry = lumps.iter().rev().find(|l| l.name == *flat).unwrap();
+                    assert_eq!(entry.size, 4096);
+                    let source = &bytes[entry.offset..entry.offset + entry.size];
+                    let pixels = image.data.as_ref().unwrap();
+                    assert_eq!(pixels.len(), 16384);
+                    for (index, pixel) in source.iter().zip(pixels.chunks_exact(4)) {
+                        let offset = usize::from(*index) * 3;
+                        assert_eq!(&pixel[..3], &palette[offset..offset + 3]);
+                        assert_eq!(pixel[3], 255);
+                    }
+                }
+                println!("FLATS\t{file}\t{name}\ttextures={}\tpixels={}", images.len(), images.len() * 4096);
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 68);
+    }
+
+
+    #[test]
+    fn doom_flat_uvs_follow_original_plane_axes() {
+        use bevy::mesh::VertexAttributeValues;
+        let native = [Vec2::new(16.0, 8.0), Vec2::new(48.0, 8.0), Vec2::new(48.0, 24.0), Vec2::new(16.0, 24.0)];
+        let center = doom_to_world(Vec2::new(32.0, 16.0));
+        let points = native.map(|p| doom_to_world(p) - center);
+        let edges = [(points[0], points[1]), (points[1], points[2]), (points[2], points[3]), (points[3], points[0])];
+        for ceiling in [false, true] {
+            let mesh = crate::map_surfaces::horizontal_mesh(&edges, 0.0, ceiling, center, 64.0 * DOOM_TO_WORLD_SCALE).unwrap();
+            let VertexAttributeValues::Float32x3(positions) = mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap() else { panic!("Invalid positions") };
+            let VertexAttributeValues::Float32x2(uvs) = mesh.attribute(Mesh::ATTRIBUTE_UV_0).unwrap() else { panic!("Invalid UVs") };
+            for (p, uv) in positions.iter().zip(uvs) {
+                let doom_x = (p[0] + center.x) / DOOM_TO_WORLD_SCALE;
+                let doom_y = -(p[2] + center.y) / DOOM_TO_WORLD_SCALE;
+                // R_MapPlane samples at world X and negative world Y.
+                assert!((uv[0] - doom_x / 64.0).abs() < 0.00001);
+                assert!((uv[1] + doom_y / 64.0).abs() < 0.00001, "Flat rows run along the wrong axis");
+            }
+        }
+    }
+
+
+    #[test]
+    #[ignore = "Requires the Freedoom reference WADs in CHICKEN_REFERENCE_DIR"]
+    fn real_freedoom_map01_camera_sweep() {
+        use crate::map_camera::{camera_anchor, clip_boom};
+        let root = std::env::var("CHICKEN_REFERENCE_DIR").expect("Set CHICKEN_REFERENCE_DIR");
+        let path = std::path::Path::new(&root).join("freedoom2.wad");
+        let mut world = World::new();
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        let mut commands = Commands::new(&mut queue, &world);
+        spawn_headless_level(&mut commands, path.to_str().unwrap(), "MAP01").unwrap();
+        queue.apply(&mut world);
+        let collision = world.resource::<WadCollisionWorld>();
+        assert_eq!(collision.player_spawns.len(), 4);
+        let radius = 0.15;
+        let mut checked = 0;
+        let mut shortened = 0;
+        for (slot, spawn) in collision.player_spawns.iter().enumerate() {
+            let pivot = camera_anchor(collision, spawn.translation + Vec3::Y * crate::player::CUBE_REST_Y, radius);
+            for yaw_step in 0..8 {
+                for pitch in [-0.8, -0.2, 0.5] {
+                    let rotation = Quat::from_euler(EulerRot::YXZ, yaw_step as f32 * std::f32::consts::FRAC_PI_4, pitch, 0.0);
+                    let desired = pivot + rotation * Vec3::new(0.0, 1.6, 5.5);
+                    let camera = clip_boom(collision, pivot, desired, radius);
+                    assert!(camera.is_finite());
+                    assert!(camera.distance(pivot) <= desired.distance(pivot) + 0.001);
+                    assert!((camera - pivot).cross(desired - pivot).length() < 0.001);
+                    // Check the whole accepted ray independently, not only its endpoint.
+                    for step in 0..=32 {
+                        let point = pivot.lerp(camera, step as f32 / 32.0);
+                        let (floor, ceiling) = collision.vertical_bounds(point).expect("Camera left the map");
+                        assert!(point.y >= floor + radius - 0.001 && point.y <= ceiling - radius + 0.001, "slot={slot} yaw={yaw_step} pitch={pitch} point={point:?} bounds={floor}..{ceiling}");
+                        for segment in &collision.segments {
+                            let p = Vec2::new(point.x, point.z);
+                            let ab = segment.end - segment.start;
+                            let t = if ab.length_squared() == 0.0 { 0.0 } else { ((p - segment.start).dot(ab) / ab.length_squared()).clamp(0.0, 1.0) };
+                            assert!(p.distance(segment.start + ab * t) >= radius - 0.001);
+                        }
+                    }
+                    shortened += usize::from(camera.distance(desired) > 0.001);
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 96);
+        assert!(shortened > 0);
+        println!("CAMERA\tfreedoom2.wad\tMAP01\trays={checked}\tshortened={shortened}");
+    }
+
+    #[test]
+    #[ignore = "Requires the separately downloaded Freedoom reference files"]
+    fn real_headless_freedoom_load_retains_collision_and_door_entities() {
+        let root = std::env::var("CHICKEN_REFERENCE_DIR").expect("Set CHICKEN_REFERENCE_DIR");
+        let path = std::path::Path::new(&root).join("freedoom2.wad");
+        let mut world = World::new();
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        let mut commands = Commands::new(&mut queue, &world);
+        let level = spawn_headless_level(&mut commands, path.to_str().unwrap(), "MAP01").unwrap();
+        queue.apply(&mut world);
+        assert_eq!(level.map_name, "MAP01");
+        assert!(level.info.suggested_plane_limit > MIN_FLOOR_HALF_EXTENT);
+        let collision = world.resource::<WadCollisionWorld>();
+        assert!(!collision.segments.is_empty());
+        assert!(!collision.doors.is_empty());
+        assert_eq!(collision.player_spawns.len(), 4);
+        for start in &collision.player_spawns {
+            assert!(collision.vertical_bounds(start.translation).is_some());
+            assert!((start.translation.y - collision.floor_height_at(start.translation) - crate::player::CUBE_REST_Y).abs() < 0.001);
+        }
+        assert_ne!(collision.player_spawns[0].translation, collision.player_spawns[1].translation);
+        for door in &collision.doors { assert!(world.get_entity(door.entity).is_ok()); }
+    }
+
+    #[test]
+    #[ignore = "Requires the separately downloaded Freedoom reference files"]
+    fn real_freedoom_maps_preserve_valid_geometry_references() {
+        let root = std::env::var("CHICKEN_REFERENCE_DIR").expect("Set CHICKEN_REFERENCE_DIR");
+        for (file, expected) in [("freedoom1.wad", 36), ("freedoom2.wad", 32)] {
+            let bytes = std::fs::read(std::path::Path::new(&root).join(file)).unwrap();
+            let lumps = parse_lump_directory(&bytes).unwrap();
+            let names = find_map_markers(&lumps);
+            assert_eq!(names.len(), expected);
+            for name in names {
+                let map = parse_map_lumps(&bytes, &lumps, &name).unwrap();
+                assert!(!map.vertices.is_empty(), "{file}:{name}");
+                assert!(!map.sectors.is_empty(), "{file}:{name}");
+                for line in &map.linedefs {
+                    assert!((line.start_vertex as usize) < map.vertices.len());
+                    assert!((line.end_vertex as usize) < map.vertices.len());
+                    for side in [line.right_sidedef, line.left_sidedef] {
+                        assert!(side == NO_SIDEDEF || (side as usize) < map.sidedefs.len());
+                    }
+                }
+                for side in &map.sidedefs { assert!((side.sector as usize) < map.sectors.len()); }
+                println!("{file}:{name}: vertices={} lines={} sectors={}", map.vertices.len(), map.linedefs.len(), map.sectors.len());
+            }
+        }
+    }
+
+
+    #[test]
+    #[ignore = "Requires the Freedoom reference WADs in CHICKEN_REFERENCE_DIR"]
+    fn real_freedoom_surface_entities_use_prepared_meshes() {
+        use bevy::mesh::VertexAttributeValues;
+        fn signature(mesh: &Mesh) -> Vec<u32> {
+            let mut bits = Vec::new();
+            for attribute in [Mesh::ATTRIBUTE_POSITION, Mesh::ATTRIBUTE_NORMAL, Mesh::ATTRIBUTE_UV_0] {
+                match mesh.attribute(attribute).unwrap() {
+                    VertexAttributeValues::Float32x3(values) => bits.extend(values.iter().flatten().map(|v| v.to_bits())),
+                    VertexAttributeValues::Float32x2(values) => bits.extend(values.iter().flatten().map(|v| v.to_bits())),
+                    _ => panic!("Invalid mesh attribute type"),
+                }
+            }
+            bits
+        }
+        let root = std::env::var("CHICKEN_REFERENCE_DIR").expect("Set CHICKEN_REFERENCE_DIR");
+        let path = std::path::Path::new(&root).join("freedoom2.wad");
+        let data = std::fs::read(&path).unwrap();
+        let lumps = parse_lump_directory(&data).unwrap();
+        let map = parse_map_lumps(&data, &lumps, "MAP01").unwrap();
+        let points: Vec<_> = map.vertices.iter().map(|v| doom_to_world(Vec2::new(v.x as f32, v.y as f32))).collect();
+        let min = points.iter().copied().fold(Vec2::splat(f32::INFINITY), Vec2::min);
+        let max = points.iter().copied().fold(Vec2::splat(f32::NEG_INFINITY), Vec2::max);
+        let center = (min + max) * 0.5;
+        let regions = sector_regions(&map, center);
+        let prepared = prepare_sector_surfaces(&map, &regions, center).unwrap();
+        let mut expected: Vec<_> = prepared.iter().map(|(mesh, _)| signature(mesh)).collect();
+        let mut world = World::new();
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        let mut commands = Commands::new(&mut queue, &world);
+        let mut meshes = Assets::<Mesh>::default();
+        let mut materials = Assets::<StandardMaterial>::default();
+        let mut images = Assets::<Image>::default();
+        try_spawn_level_from_selection(&mut commands, &mut meshes, &mut materials, Some(&mut images), path.to_str().unwrap(), "MAP01").unwrap();
+        queue.apply(&mut world);
+        let by_mesh: std::collections::BTreeMap<_, _> = prepared.iter().map(|(mesh, name)| (signature(mesh), name)).collect();
+        let mut material_ids = std::collections::BTreeMap::new();
+        let palette_entry = lumps.iter().rev().find(|l| l.name == "PLAYPAL").unwrap();
+        let palette = &data[palette_entry.offset..palette_entry.offset + 768];
+        for (mesh, material) in world.query_filtered::<(&Mesh3d, &MeshMaterial3d<StandardMaterial>), With<crate::scene::LevelGeometry>>().iter(&world) {
+            let mesh = meshes.get(&mesh.0).unwrap();
+            if mesh.indices().is_some() { continue; }
+            let name = by_mesh[&signature(mesh)];
+            if let Some(previous) = material_ids.insert(name, material.0.id()) { assert_eq!(previous, material.0.id()); }
+            let material = materials.get(&material.0).unwrap();
+            assert_eq!(material.base_color, Color::WHITE);
+            assert!(material.unlit);
+            let image = images.get(material.base_color_texture.as_ref().expect("Surface has no flat image")).unwrap();
+            let entry = lumps.iter().rev().find(|l| l.name == *name).unwrap();
+            let source = &data[entry.offset..entry.offset + entry.size];
+            assert_eq!(source.len(), 4096);
+            assert_eq!(image.data.as_ref().unwrap().len(), 16384);
+            for (index, pixel) in source.iter().zip(image.data.as_ref().unwrap().chunks_exact(4)) {
+                let offset = usize::from(*index) * 3;
+                assert_eq!(&pixel[..3], &palette[offset..offset + 3]);
+                assert_eq!(pixel[3], 255);
+            }
+        }
+        assert_eq!(images.len(), material_ids.len());
+        let mut actual: Vec<_> = world.query_filtered::<&Mesh3d, With<crate::scene::LevelGeometry>>()
+            .iter(&world).map(|handle| meshes.get(&handle.0).unwrap())
+            .filter(|mesh| mesh.indices().is_none()).map(signature).collect();
+        assert!(!actual.is_empty());
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    #[ignore = "Requires the Freedoom reference WADs in CHICKEN_REFERENCE_DIR"]
+    fn real_freedoom_sector_surfaces() {
+        use bevy::mesh::VertexAttributeValues;
+        let root = std::path::PathBuf::from(std::env::var("CHICKEN_REFERENCE_DIR").expect("Set CHICKEN_REFERENCE_DIR"));
+        let mut maps_checked = 0usize;
+        for (file, expected) in [("freedoom1.wad", 36), ("freedoom2.wad", 32)] {
+            let data = std::fs::read(root.join(file)).unwrap();
+            let lumps = parse_lump_directory(&data).unwrap();
+            let names: Vec<_> = lumps.iter().filter(|lump| is_map_marker_name(&lump.name)).map(|lump| lump.name.clone()).collect();
+            assert_eq!(names.len(), expected);
+            for name in names {
+                let map = parse_map_lumps(&data, &lumps, &name).unwrap();
+                let min = map.vertices.iter().map(|v| doom_to_world(Vec2::new(v.x as f32, v.y as f32))).fold(Vec2::splat(f32::INFINITY), Vec2::min);
+                let max = map.vertices.iter().map(|v| doom_to_world(Vec2::new(v.x as f32, v.y as f32))).fold(Vec2::splat(f32::NEG_INFINITY), Vec2::max);
+                let center = (min + max) * 0.5;
+                let regions = sector_regions(&map, center);
+                let surfaces = prepare_sector_surfaces(&map, &regions, center).unwrap_or_else(|e| panic!("{file}:{name}: {e}"));
+                assert!(!surfaces.is_empty(), "{file}:{name}");
+                let mut surface_index = 0usize;
+                let mut vertices = 0usize;
+                for (sector_index, (sector, region)) in map.sectors.iter().zip(&regions).enumerate() {
+                    if region.edges.is_empty() { continue; }
+                    for (height, ceiling, texture) in [(region.floor, false, &sector.floor_texture), (region.ceiling, true, &sector.ceiling_texture)] {
+                        if texture.eq_ignore_ascii_case("F_SKY1") { continue; }
+                        let (mesh, name) = &surfaces[surface_index];
+                        surface_index += 1;
+                        assert_eq!(*name, clean_texture_name(texture));
+                        let VertexAttributeValues::Float32x3(positions) = mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap() else { panic!("Invalid position type") };
+                        let VertexAttributeValues::Float32x3(normals) = mesh.attribute(Mesh::ATTRIBUTE_NORMAL).unwrap() else { panic!("Invalid normal type") };
+                        let VertexAttributeValues::Float32x2(uvs) = mesh.attribute(Mesh::ATTRIBUTE_UV_0).unwrap() else { panic!("Invalid UV type") };
+                        assert_eq!(positions.len() % 3, 0);
+                        assert!(!positions.is_empty());
+                        assert_eq!(normals.len(), positions.len());
+                        assert_eq!(uvs.len(), positions.len());
+                        vertices += positions.len();
+                        let expected_normal = if ceiling { -Vec3::Y } else { Vec3::Y };
+                        for face in positions.chunks_exact(3) {
+                            let [a, b, c] = [Vec3::from(face[0]), Vec3::from(face[1]), Vec3::from(face[2])];
+                            assert!((b - a).cross(c - a).dot(expected_normal) > 0.0);
+                            let mid = (a + b + c) / 3.0;
+                            assert!(region.contains(Vec2::new(mid.x, mid.z)), "{file}:{sector_index}: Triangle lies outside its sector at {mid:?}");
+                        }
+                        for ((position, normal), uv) in positions.iter().zip(normals).zip(uvs) {
+                            assert_eq!(position[1], height);
+                            assert_eq!(*normal, expected_normal.to_array());
+                            assert!(position.iter().chain(uv).all(|v| v.is_finite()));
+                            assert_eq!(*uv, [(position[0] + center.x) / (64.0 * DOOM_TO_WORLD_SCALE), (position[2] + center.y) / (64.0 * DOOM_TO_WORLD_SCALE)]);
+                        }
+                    }
+                }
+                assert_eq!(surface_index, surfaces.len());
+                println!("SURFACES\t{file}\t{name}\t{}\t{}\t{vertices}", regions.len(), surfaces.len());
+                maps_checked += 1;
+            }
+        }
+        assert_eq!(maps_checked, 68);
+    }
 
     #[test]
     fn read_entry_bytes_capped_accepts_data_within_limit() {

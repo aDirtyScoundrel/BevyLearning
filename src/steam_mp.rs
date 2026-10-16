@@ -99,12 +99,7 @@ mod imp {
         last_activity: Instant,
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum SteamClientAuthState {
-        Unauthenticated,
-        AwaitingChallenge,
-        Authenticated,
-    }
+    type SteamClientAuthState = learning::client::ClientAuthState;
 
     #[derive(Resource)]
     pub struct SteamSync {
@@ -346,6 +341,16 @@ mod imp {
             return;
         };
 
+        let base_secret = std::env::var("STEAM_AUTH_SECRET")
+            .unwrap_or_else(|_| "dev-auth-secret".to_string());
+        let auth_secret = match learning::map_identity::configured_auth_secret(&base_secret) {
+            Ok(secret) => secret,
+            Err(error) => {
+                eprintln!("[steam-mp] {error}");
+                return;
+            }
+        };
+
         thread::spawn(move || {
             loop {
                 single.run_callbacks();
@@ -392,8 +397,7 @@ mod imp {
             last_send: Instant::now(),
             presence_state: PresenceState::Pending,
             role,
-            auth_secret: std::env::var("STEAM_AUTH_SECRET")
-                .unwrap_or_else(|_| "dev-auth-secret".to_string()),
+            auth_secret,
             client_auth_state: SteamClientAuthState::Unauthenticated,
             client_session_token: None,
             client_input_sequence: 0,
@@ -523,11 +527,29 @@ mod imp {
         local_cube_query: Query<&Transform, With<crate::RotatingCube>>,
         hud: Res<crate::ui::HudState>,
         mut steam: Option<ResMut<SteamSync>>,
+        mut retry: Local<learning::client::HandshakeRetry>,
     ) {
         let Some(steam) = steam.as_deref_mut() else {
             return;
         };
 
+        if steam.role == RuntimeSteamRole::UntrustedClient {
+            match retry.poll(Instant::now(), steam.client_auth_state == SteamClientAuthState::Authenticated) {
+                learning::client::HandshakeAction::SendHello => {
+                    if steam.client_auth_state == SteamClientAuthState::Unauthenticated {
+                        steam.client_auth_state = SteamClientAuthState::AwaitingChallenge;
+                    }
+                    let payload = encode_auth_hello(steam.client.user().steam_id().raw());
+                    send_auth_payload_to_host(steam, &payload);
+                }
+                learning::client::HandshakeAction::TimedOut => {
+                    steam.client_auth_state = SteamClientAuthState::Unauthenticated;
+                    eprintln!("[steam-mp] Connection timed out. Check the host and authentication settings.");
+                }
+                learning::client::HandshakeAction::Wait => {}
+            }
+            return;
+        }
         if steam.presence_state == PresenceState::Announced || steam.targets.is_empty() {
             return;
         }
@@ -807,6 +829,7 @@ mod imp {
         hud: Res<crate::ui::HudState>,
         ergo: Res<crate::config::HumanErgoConfig>,
         input_intent: Res<crate::controls::PlayerInputIntent>,
+        map: Option<Res<crate::doom_wad::WadCollisionWorld>>,
         mut steam: Option<ResMut<SteamSync>>,
     ) {
         let Some(steam) = steam.as_deref_mut() else {
@@ -848,7 +871,7 @@ mod imp {
                 send_game_payload_to_host(steam, &payload);
             }
             RuntimeSteamRole::AuthHost => {
-                host_step_authoritative_sim(steam, &ergo, SEND_INTERVAL.as_secs_f32());
+                host_step_authoritative_sim(steam, &ergo, SEND_INTERVAL.as_secs_f32(), map.as_deref());
                 host_broadcast_snapshot(steam);
             }
         }
@@ -1093,8 +1116,11 @@ mod imp {
         local_id: u64,
         data: &[u8],
     ) {
-        if steam.auth_host.is_some_and(|host| host != remote) {
+        if steam.auth_host != Some(remote) {
             steam.metrics.client_auth_peer_mismatch_drops += 1;
+            return;
+        }
+        if !crate::auth_codec::client_packet_allowed(true, steam.client_auth_state, data) {
             return;
         }
 
@@ -1103,6 +1129,7 @@ mod imp {
             let proof = learning::auth::make_auth_proof(&steam.auth_secret, local_id, nonce);
             let payload = encode_auth_proof(proof);
             steam.metrics.client_auth_proofs_sent += 1;
+            steam.client_auth_state = SteamClientAuthState::AwaitingAcceptance;
             send_auth_payload_to_host(steam, &payload);
             return;
         }
@@ -1173,13 +1200,22 @@ mod imp {
                 && proof.player_id == session.player_id
                 && learning::auth::verify_auth_proof(&steam.auth_secret, proof)
             {
-                let token = learning::auth::mint_session_token(
-                    &steam.auth_secret,
-                    proof.player_id,
-                    proof.nonce,
-                );
+                // Re-authentication is idempotent: a retried proof (the client
+                // never received the first accept) re-sends the existing token
+                // instead of minting a second valid one. Same rule as the LAN
+                // host in server/mod.rs.
+                let already_issued = session.token.is_some();
+                let token = session.token.unwrap_or_else(|| {
+                    learning::auth::mint_session_token(
+                        &steam.auth_secret,
+                        proof.player_id,
+                        proof.nonce,
+                    )
+                });
                 session.token = Some(token);
-                steam.token_to_player.insert(token, proof.player_id);
+                if !already_issued {
+                    steam.token_to_player.insert(token, proof.player_id);
+                }
                 steam.metrics.host_auth_accepts_sent += 1;
                 send_auth_payload_to_peer(steam, remote, &encode_auth_accept(token));
                 true
@@ -1329,6 +1365,7 @@ mod imp {
         steam: &mut SteamSync,
         ergo: &crate::config::HumanErgoConfig,
         dt: f32,
+        map: Option<&crate::doom_wad::WadCollisionWorld>,
     ) {
         // Thin adapter over the shared sim. The Steam and LAN transports
         // keep their authoritative state in differently-shaped containers
@@ -1342,6 +1379,7 @@ mod imp {
             &mut steam.authoritative_vertical_velocity,
             ergo,
             dt,
+            map,
         );
     }
 
@@ -1352,10 +1390,11 @@ mod imp {
             .map(|(player_id, state)| (*player_id, state.transform, state.color))
             .collect::<Vec<_>>();
 
-        let payload = encode_snapshot_packet(&states);
-        for (peer, session) in &steam.auth_sessions {
-            if session.token.is_some() {
-                send_game_payload_to_peer(steam, *peer, &payload);
+        for payload in crate::auth_codec::snapshot_packets(STEAM_SYNC_MAGIC, STEAM_SYNC_VERSION, &states) {
+            for (peer, session) in &steam.auth_sessions {
+                if session.token.is_some() {
+                    send_game_payload_to_peer(steam, *peer, &payload);
+                }
             }
         }
     }
@@ -1497,9 +1536,6 @@ mod imp {
         crate::auth_codec::decode_input_packet(STEAM_SYNC_MAGIC, STEAM_SYNC_VERSION, data)
     }
 
-    fn encode_snapshot_packet(states: &[(u64, Transform, Color)]) -> Vec<u8> {
-        crate::auth_codec::encode_snapshot_packet(STEAM_SYNC_MAGIC, STEAM_SYNC_VERSION, states)
-    }
 
     fn decode_snapshot_packet(data: &[u8]) -> Option<Vec<(u64, Transform, Color)>> {
         crate::auth_codec::decode_snapshot_packet(STEAM_SYNC_MAGIC, STEAM_SYNC_VERSION, data)

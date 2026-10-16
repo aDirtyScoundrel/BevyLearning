@@ -1,4 +1,9 @@
-# Classic Map Compatibility — Action Plan
+# Classic map support: historical plan
+
+> This plan contains superseded implementation and scope claims.
+> Read [CLASSIC_MAP_PROGRESS.md](CLASSIC_MAP_PROGRESS.md) for the checked status and remaining work.
+> Doom-family and Marathon/Aleph One maps are both in scope.
+> Do not treat the special-ID tables below as verified original-engine semantics.
 
 Design goal: this engine should be able to load and play open-source /
 freely-distributable maps from classic id-Tech-lineage games **as-is, with

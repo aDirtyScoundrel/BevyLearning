@@ -4,6 +4,63 @@
 
 pub mod state_sync;
 
+#[derive(Debug, Default)]
+pub struct HandshakeRetry {
+    started: Option<std::time::Instant>,
+    last_sent: Option<std::time::Instant>,
+    finished: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum HandshakeAction {
+    Wait,
+    SendHello,
+    TimedOut,
+}
+
+impl HandshakeRetry {
+    pub fn poll(&mut self, now: std::time::Instant, authenticated: bool) -> HandshakeAction {
+        use std::time::Duration;
+        if authenticated {
+            self.finished = true;
+        }
+        if self.finished {
+            return HandshakeAction::Wait;
+        }
+        let started = *self.started.get_or_insert(now);
+        if now.saturating_duration_since(started) >= Duration::from_secs(10) {
+            self.finished = true;
+            return HandshakeAction::TimedOut;
+        }
+        if self.last_sent.is_some_and(|last| now.saturating_duration_since(last) < Duration::from_millis(500)) {
+            return HandshakeAction::Wait;
+        }
+        self.last_sent = Some(now);
+        HandshakeAction::SendHello
+    }
+}
+
+#[cfg(test)]
+mod handshake_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn retries_have_a_deadline_and_stop_after_authentication() {
+        let start = Instant::now();
+        let mut retry = HandshakeRetry::default();
+        assert_eq!(retry.poll(start, false), HandshakeAction::SendHello);
+        assert_eq!(retry.poll(start + Duration::from_millis(499), false), HandshakeAction::Wait);
+        assert_eq!(retry.poll(start + Duration::from_millis(500), false), HandshakeAction::SendHello);
+        assert_eq!(retry.poll(start + Duration::from_secs(10), false), HandshakeAction::TimedOut);
+        assert_eq!(retry.poll(start + Duration::from_secs(11), false), HandshakeAction::Wait);
+        let mut retry = HandshakeRetry::default();
+        assert_eq!(retry.poll(start, false), HandshakeAction::SendHello);
+        assert_eq!(retry.poll(start + Duration::from_secs(1), true), HandshakeAction::Wait);
+        assert_eq!(retry.poll(start + Duration::from_secs(20), true), HandshakeAction::Wait);
+    }
+}
+
 use std::io;
 use std::net::SocketAddr;
 

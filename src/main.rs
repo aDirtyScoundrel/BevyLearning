@@ -10,6 +10,10 @@ mod skybox;
 mod steam_mp;
 mod player;
 mod doom_wad;
+mod doom_flats;
+mod map_surfaces;
+mod map_camera;
+mod render_startup;
 mod sync_codec;
 mod remote_runtime;
 mod server_tick;
@@ -95,13 +99,38 @@ fn capture_app_exit(
     }
 }
 
-/// Skips the main menu when this process was launched pointed at an
-/// existing multiplayer host (`CUBE_AUTH_SERVER_ADDR` set) — the LAN/Steam
-/// client-join flow driven by env vars is unchanged by the addition of the
-/// title screen; only a plain launch with no target host shows the menu.
+/// Enter the game when the launch selects a multiplayer connection.
+fn multiplayer_launch_requested(mut get: impl FnMut(&str) -> Option<String>) -> bool {
+    get("CUBE_AUTH_SERVER_ADDR").is_some()
+        || get("STEAM_AUTH_HOST").is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        || get("STEAM_AUTH_HOST_ID").is_some()
+        || get("STEAM_REMOTE_IDS").is_some_and(|value| !value.trim().is_empty())
+}
+
 fn skip_menu_for_existing_join_target(mut next_state: ResMut<NextState<AppState>>) {
-    if std::env::var("CUBE_AUTH_SERVER_ADDR").is_ok() {
+    if multiplayer_launch_requested(|name| std::env::var(name).ok()) {
         next_state.set(AppState::InGame);
+    }
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::*;
+
+    #[test]
+    fn multiplayer_launches_skip_menu_without_changing_plain_launches() {
+        assert!(!multiplayer_launch_requested(|_| None));
+        for (name, value, expected) in [
+            ("CUBE_AUTH_SERVER_ADDR", "127.0.0.1:7777", true),
+            ("STEAM_AUTH_HOST", "1", true),
+            ("STEAM_AUTH_HOST", "true", true),
+            ("STEAM_AUTH_HOST", "0", false),
+            ("STEAM_AUTH_HOST_ID", "123", true),
+            ("STEAM_REMOTE_IDS", "123,456", true),
+            ("STEAM_REMOTE_IDS", "", false),
+        ] {
+            assert_eq!(multiplayer_launch_requested(|key| (key == name).then(|| value.to_owned())), expected, "{name}={value}");
+        }
     }
 }
 
@@ -124,6 +153,11 @@ fn add_player_controller_systems(app: &mut App) {
         Update,
         controls::follow_cube_camera
             .after(controls::move_cube)
+            .after(controls::mouse_look)
+            .after(multiplayer::apply_local_reconciliation)
+            .after(multiplayer::apply_local_sim_result)
+            .after(steam_mp::apply_local_reconciliation)
+            .after(doom_wad::update_wad_doors)
             .run_if(in_state(AppState::InGame)),
     )
     .add_systems(
@@ -183,7 +217,7 @@ fn run_headless_server() {
         .insert_resource(config::HumanErgoConfig::default())
         .insert_resource(ExitRequested::default())
         .insert_resource(local_player_id)
-        .add_systems(Startup, multiplayer::setup_network)
+        .add_systems(Startup, (doom_wad::setup_headless_level, multiplayer::setup_network).chain())
         .add_systems(
             Update,
             (capture_app_exit, multiplayer::send_local_leave).chain(),
@@ -229,6 +263,7 @@ fn run_client() {
                 ..default()
             }),
     )
+        .add_plugins(render_startup::StartupSurfacePlugin)
         .add_plugins(TabNavigationPlugin)
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .add_plugins(FpsOverlayPlugin {

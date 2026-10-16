@@ -286,7 +286,7 @@ pub fn setup(
         GlobalTransform::default(),
     ));
 
-    let level_spawn_info = crate::doom_wad::spawn_level_from_env(&mut commands, &mut meshes, &mut materials);
+    let level_spawn_info = crate::doom_wad::spawn_level_from_env(&mut commands, &mut meshes, &mut materials, Some(&mut images));
     let player_spawn_transform = level_spawn_info
         .as_ref()
         .map(|info| Transform::from_translation(info.player_spawn).with_rotation(Quat::from_rotation_y(info.player_yaw)))
@@ -333,6 +333,7 @@ pub fn setup(
         .with_children(|pivot| {
             pivot.spawn((
                 Camera3d::default(),
+                crate::map_camera::CameraBoom { rest_offset: Vec3::new(0.0, CAMERA_HEIGHT, CAMERA_DISTANCE) },
                 Transform::from_xyz(0.0, CAMERA_HEIGHT, CAMERA_DISTANCE)
                     .looking_at(Vec3::ZERO, Vec3::Y),
                 GlobalTransform::default(),
@@ -376,6 +377,7 @@ pub fn handle_reload_level_requests(
         &mut commands,
         &mut meshes,
         &mut materials,
+        Some(&mut images),
         &request.wad_path,
         &request.map_name,
     );
@@ -445,8 +447,9 @@ pub fn update_camera_aim_cone(
         Query<&mut Transform, (With<ChickenHead>, Without<CameraAimCone>, Without<RotatingCube>)>,
     )>,
     camera_query: Query<&GlobalTransform, (With<Camera3d>, Without<CameraAimCone>)>,
-    body_global_query: Query<&GlobalTransform, With<RotatingCube>>,
+    body_global_query: Query<(Entity, &GlobalTransform), With<RotatingCube>>,
     head_global_query: Query<&GlobalTransform, With<ChickenHead>>,
+    head_child_query: Query<(Entity, &ChildOf), With<ChickenHead>>,
     time: Res<Time>,
 ) {
     let Ok(camera_transform) = camera_query.single() else {
@@ -478,12 +481,21 @@ pub fn update_camera_aim_cone(
         (body_transform.translation, body_transform.rotation, should_rotate)
     };
 
-    let body_global_fwd = {
-        let Ok(body_global) = body_global_query.single() else {
+    let (local_body, body_global_fwd) = {
+        let Ok((body_entity, body_global)) = body_global_query.single() else {
             return;
         };
-        body_global.forward()
+        (body_entity, body_global.forward())
     };
+
+    // Remote chickens also carry ChickenHead, so the local head must be
+    // resolved through its ChildOf link to the local body, the same way
+    // spawn_cone_projectile resolves it. A bare single() over all heads
+    // silently fails whenever any remote chicken is present.
+    let local_head_entity = head_child_query
+        .iter()
+        .find(|(_, child_of)| child_of.parent() == local_body)
+        .map(|(head_entity, _)| head_entity);
 
     let anchor = body_translation + Vec3::Y * AIM_CONE_OFFSET_Y;
     let camera_pos = camera_transform.translation();
@@ -517,8 +529,10 @@ pub fn update_camera_aim_cone(
         
         // Make chicken body align with head direction (after delay)
         if should_rotate {
-            let Ok(head_global) = head_global_query.single() else {
-                // If no head found, fall back to camera direction
+            let Some(head_global) = local_head_entity
+                .and_then(|head_entity| head_global_query.get(head_entity).ok())
+            else {
+                // If no local head found, fall back to camera direction
                 let camera_fwd_xz = Vec3::new(-camera_forward.x, 0.0, -camera_forward.z).normalize_or_zero();
                 let body_fwd_xz = Vec3::new(body_global_fwd.x, 0.0, body_global_fwd.z).normalize_or_zero();
                 
@@ -563,10 +577,10 @@ pub fn update_camera_aim_cone(
             }
         }
         
-        // Update head to point in the same direction as the camera
-        {
+        // Update the local head to point in the same direction as the camera
+        if let Some(head_entity) = local_head_entity {
             let mut head_query = queries.p2();
-            if let Ok(mut head_transform) = head_query.single_mut() {
+            if let Ok(mut head_transform) = head_query.get_mut(head_entity) {
                 // Convert camera forward direction to body-local space (negated to face correctly)
                 let local_camera_fwd = body_rotation.inverse() * (-camera_forward.as_vec3());
                 // Only use horizontal component (parallel to floor) - ignore vertical look
@@ -588,8 +602,10 @@ pub fn spawn_cone_projectile(
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     menu_state: Option<Res<crate::ui::EscapeMenuState>>,
     local_player: Res<crate::multiplayer::LocalPlayerId>,
-    beak_query: Query<&GlobalTransform, With<Beak>>,
-    head_query: Query<&GlobalTransform, With<ChickenHead>>,
+    beak_query: Query<(Entity, &GlobalTransform), With<Beak>>,
+    head_query: Query<(Entity, &GlobalTransform), With<ChickenHead>>,
+    body_query: Query<Entity, With<RotatingCube>>,
+    child_of_query: Query<&ChildOf>,
     mut projectile_sequence: ResMut<ProjectileSequence>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -603,13 +619,41 @@ pub fn spawn_cone_projectile(
         return;
     }
 
-    let Ok(beak_global) = beak_query.single() else {
+    // Find the local RotatingCube entity
+    let Ok(local_body) = body_query.single() else {
         return;
     };
-    let Ok(head_global) = head_query.single() else {
+
+    // Find the head belonging to the local body via ChildOf
+    let mut local_head = None;
+    for (head_entity, head_global) in head_query.iter() {
+        if let Ok(child_of) = child_of_query.get(head_entity) {
+            if child_of.parent() == local_body {
+                local_head = Some((head_entity, head_global));
+                break;
+            }
+        }
+    }
+
+    let Some((head_entity, head_global)) = local_head else {
         return;
     };
-    
+
+    // Find the beak belonging to the local head via ChildOf
+    let mut local_beak = None;
+    for (beak_entity, beak_global) in beak_query.iter() {
+        if let Ok(child_of) = child_of_query.get(beak_entity) {
+            if child_of.parent() == head_entity {
+                local_beak = Some(beak_global);
+                break;
+            }
+        }
+    }
+
+    let Some(beak_global) = local_beak else {
+        return;
+    };
+
     // Fire seed from beak position in direction head is facing
     let beak_transform = beak_global.compute_transform();
     let head_forward = head_global.forward();
@@ -620,7 +664,7 @@ pub fn spawn_cone_projectile(
         velocity: head_forward * SEED_PROJECTILE_SPEED,
         lifetime_secs: SEED_PROJECTILE_LIFETIME_SECS,
     };
-    
+
     spawn_projectile_entity(
         &mut commands,
         &mut meshes,
@@ -632,7 +676,7 @@ pub fn spawn_cone_projectile(
 
     // Firing feedback: muzzle flash visual + console log for debugging
     println!("[FIRE] Projectile spawned at {:?} with velocity {:?}", spawn_data.position, spawn_data.velocity);
-    
+
     // Create a brief muzzle flash (yellow sphere at beak position)
     let flash_mesh = meshes.add(Mesh::from(bevy::math::primitives::Sphere {
         radius: 0.08,
@@ -642,7 +686,7 @@ pub fn spawn_cone_projectile(
         emissive: LinearRgba::rgb(1.0, 0.9, 0.3) * 2.0,
         ..default()
     });
-    
+
     commands.spawn((
         Mesh3d(flash_mesh),
         MeshMaterial3d(flash_material),
@@ -720,6 +764,112 @@ pub fn resolve_projectile_collisions(
             target_id,
             lan_network.as_deref_mut(),
             steam_sync.as_deref_mut(),
+        );
+    }
+}
+
+#[cfg(test)]
+mod firing_regression_tests {
+    use super::*;
+
+    #[test]
+    fn local_shot_uses_local_parts_with_remote_chicken_present() {
+        for (has_local, menu_open, expected) in [(true, false, 1), (true, true, 0), (false, false, 0)] {
+            let mut app = App::new();
+            app.insert_resource(ButtonInput::<MouseButton>::default())
+                .insert_resource(crate::multiplayer::LocalPlayerId { value: 1 })
+                .init_resource::<ProjectileSequence>()
+                .init_resource::<Assets<Mesh>>()
+                .init_resource::<Assets<StandardMaterial>>()
+                .init_resource::<crate::ui::EscapeMenuState>()
+                .add_systems(Update, spawn_cone_projectile);
+            app.world_mut().resource_mut::<crate::ui::EscapeMenuState>().is_open = menu_open;
+            for (local, x) in [(false, 100.0), (has_local, 2.0)] {
+                let body = app.world_mut().spawn_empty().id();
+                if local {
+                    app.world_mut().entity_mut(body).insert(RotatingCube);
+                }
+                let head = app.world_mut().spawn((ChickenHead, GlobalTransform::default(), ChildOf(body))).id();
+                app.world_mut().spawn((Beak, GlobalTransform::from_translation(Vec3::new(x, 1.0, 0.0)), ChildOf(head)));
+            }
+            app.world_mut().resource_mut::<ButtonInput<MouseButton>>().press(MouseButton::Left);
+            app.update();
+            let mut query = app.world_mut().query_filtered::<&Transform, With<ConeProjectile>>();
+            let shots: Vec<_> = query.iter(app.world()).collect();
+            assert_eq!(shots.len(), expected);
+            if let Some(shot) = shots.first() {
+                assert_eq!(shot.translation.x, 2.0);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod aim_regression_tests {
+    use super::*;
+
+    #[test]
+    fn local_head_tracks_camera_with_remote_chicken_present() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .add_systems(Update, update_camera_aim_cone);
+
+        let world = app.world_mut();
+        let local_body = world
+            .spawn((
+                RotatingCube,
+                Transform::default(),
+                GlobalTransform::default(),
+                HeadTurnDelayTimer {
+                    elapsed: 0.0,
+                    delay_secs: 0.0,
+                },
+            ))
+            .id();
+        let local_head = world
+            .spawn((
+                ChickenHead,
+                Transform::default(),
+                GlobalTransform::default(),
+                ChildOf(local_body),
+            ))
+            .id();
+        let remote_body = world.spawn_empty().id();
+        let remote_head = world
+            .spawn((
+                ChickenHead,
+                Transform::default(),
+                GlobalTransform::default(),
+                ChildOf(remote_body),
+            ))
+            .id();
+        world.spawn((CameraAimCone, Transform::default()));
+        // Camera yawed +90 degrees looks down -X, so the head target sits a
+        // 90-degree Y rotation away from the identity pose and the 0.1 slerp
+        // makes any successful head update observable. The system reads the
+        // GlobalTransform, so both transforms carry the rotation.
+        let camera_transform = Transform::from_xyz(0.0, 5.0, 0.0)
+            .with_rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_2));
+        world.spawn((
+            Camera3d::default(),
+            camera_transform,
+            GlobalTransform::from(camera_transform),
+        ));
+
+        app.update();
+
+        let world = app.world_mut();
+        let local_rotation = world.entity(local_head).get::<Transform>().unwrap().rotation;
+        let remote_rotation = world.entity(remote_head).get::<Transform>().unwrap().rotation;
+        assert_ne!(
+            local_rotation,
+            Quat::IDENTITY,
+            "local head must track the camera even with a remote chicken present"
+        );
+        assert_eq!(
+            remote_rotation,
+            Quat::IDENTITY,
+            "remote head must not be touched"
         );
     }
 }

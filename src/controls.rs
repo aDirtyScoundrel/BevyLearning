@@ -225,6 +225,7 @@ pub fn move_cube(
     mut query: Query<&mut Transform, With<crate::RotatingCube>>,
 ) {
     if let Some(menu_state) = menu_state && menu_state.is_open {
+        *input_intent = PlayerInputIntent::default();
         return;
     }
 
@@ -328,7 +329,8 @@ pub fn move_cube(
 
     for mut transform in &mut query {
         let player_scale = ergo.movement.player_scale.clamp(0.35, 3.0);
-        let rest_y = crate::player::CUBE_REST_Y * player_scale;
+        let body_height = crate::player::CUBE_REST_Y * player_scale;
+        let rest_y = body_height + wad_collision.as_deref().map_or(0.0, |map| map.floor_height_at(transform.translation));
         transform.scale = Vec3::splat(player_scale);
 
         if auth_server_owns_physics {
@@ -351,6 +353,7 @@ pub fn move_cube(
             movement_state.vertical_velocity = 0.0;
             transform.translation += noclip_movement;
         } else {
+            let previous = transform.translation;
             movement_state.vertical_velocity -= ergo.movement.gravity * dt;
 
             transform.translation += horizontal_movement;
@@ -366,9 +369,10 @@ pub fn move_cube(
                 .clamp(-ergo.movement.plane_limit, ergo.movement.plane_limit);
 
             if let Some(wad_collision) = &wad_collision {
-                transform.translation = wad_collision.resolve_position(transform.translation);
+                transform.translation = wad_collision.resolve_motion(previous, transform.translation);
             }
 
+            let rest_y = body_height + wad_collision.as_deref().map_or(0.0, |map| map.floor_height_at(transform.translation));
             if transform.translation.y <= rest_y {
                 transform.translation.y = rest_y;
                 movement_state.vertical_velocity = 0.0;
@@ -408,16 +412,84 @@ pub fn mouse_look(
     transform.rotation = Quat::from_euler(EulerRot::YXZ, rig.yaw, rig.pitch, 0.0);
 }
 
+#[allow(clippy::type_complexity)]
 pub fn follow_cube_camera(
-    cube: Query<&Transform, (With<crate::RotatingCube>, Without<CameraOrbitRig>)>,
-    mut camera_rig: Query<&mut Transform, (With<CameraOrbitRig>, Without<crate::RotatingCube>)>,
+    cube: Query<&Transform, (With<crate::RotatingCube>, Without<CameraOrbitRig>, Without<Camera3d>)>,
+    mut camera_rig: Query<(Entity, &mut Transform), (With<CameraOrbitRig>, Without<crate::RotatingCube>, Without<Camera3d>)>,
+    mut cameras: Query<(&ChildOf, &crate::map_camera::CameraBoom, &Projection, &mut Transform), (With<Camera3d>, Without<CameraOrbitRig>, Without<crate::RotatingCube>)>,
+    map: Option<Res<crate::doom_wad::WadCollisionWorld>>,
+    noclip: Option<Res<NoclipState>>,
 ) {
-    let Ok(cube_transform) = cube.single() else {
-        return;
-    };
-    let Ok(mut rig_transform) = camera_rig.single_mut() else {
-        return;
-    };
+    let Ok(cube_transform) = cube.single() else { return; };
+    let Ok((rig_entity, mut rig_transform)) = camera_rig.single_mut() else { return; };
+    let pivot = cube_transform.translation + Vec3::Y * (crate::player::CUBE_REST_Y * cube_transform.scale.y);
+    rig_transform.translation = pivot;
+    let map = map.as_deref().filter(|_| !noclip.is_some_and(|state| state.enabled));
+    for (parent, boom, projection, mut camera) in &mut cameras {
+        if parent.parent() != rig_entity { continue; }
+        let Some(map) = map else {
+            camera.translation = boom.rest_offset;
+            continue;
+        };
+        let radius = crate::map_camera::near_plane_radius(projection);
+        rig_transform.translation = crate::map_camera::camera_anchor(map, pivot, radius);
+        let desired = rig_transform.transform_point(boom.rest_offset);
+        let position = crate::map_camera::clip_boom(map, rig_transform.translation, desired, radius);
+        camera.translation = rig_transform.compute_affine().inverse().transform_point3(position);
+    }
+}
 
-    rig_transform.translation = cube_transform.translation + Vec3::Y * (crate::player::CUBE_REST_Y * cube_transform.scale.y);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn camera_follow_clips_and_restores_the_owned_boom() {
+        use crate::doom_wad::{WadCollisionWorld, WallCollisionSegment};
+        use crate::map_camera::CameraBoom;
+        let mut app = App::new();
+        app.add_systems(Update, follow_cube_camera);
+        app.init_resource::<NoclipState>();
+        app.world_mut().spawn((crate::RotatingCube, Transform::from_xyz(0.0, 0.75, 0.0)));
+        let rotation = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        let rig = app.world_mut().spawn((CameraOrbitRig { yaw: std::f32::consts::FRAC_PI_2, pitch: 0.0 }, Transform::from_rotation(rotation))).id();
+        let offset = Vec3::new(0.0, 0.0, 5.5);
+        let camera = app.world_mut().spawn((Camera3d::default(), Projection::default(), CameraBoom { rest_offset: offset }, Transform::from_translation(offset), ChildOf(rig))).id();
+        app.insert_resource(WadCollisionWorld { segments: vec![WallCollisionSegment { start: Vec2::new(1.0, -4.0), end: Vec2::new(1.0, 4.0) }], ..default() });
+        app.update();
+        let parent = *app.world().get::<Transform>(rig).unwrap();
+        let local = *app.world().get::<Transform>(camera).unwrap();
+        let position = parent.transform_point(local.translation);
+        assert!(position.x > 0.8 && position.x < 0.9, "{position:?}");
+        assert_eq!(parent.translation.y, 1.5);
+        app.world_mut().resource_mut::<NoclipState>().enabled = true;
+        app.update();
+        assert_eq!(app.world().get::<Transform>(camera).unwrap().translation, offset);
+        app.world_mut().resource_mut::<NoclipState>().enabled = false;
+        app.world_mut().resource_mut::<WadCollisionWorld>().segments.clear();
+        app.update();
+        assert!((app.world().get::<Transform>(camera).unwrap().translation - offset).length() < 0.0001);
+        app.world_mut().remove_resource::<WadCollisionWorld>();
+        app.update();
+        assert_eq!(app.world().get::<Transform>(camera).unwrap().translation, offset);
+    }
+
+    #[test]
+    fn menu_clears_movement_and_jump_before_network_send() {
+        let mut app = App::new();
+        app.init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<Time>()
+            .init_resource::<ControlBindings>()
+            .init_resource::<crate::config::HumanErgoConfig>()
+            .init_resource::<MovementState>()
+            .init_resource::<NoclipState>()
+            .init_resource::<MovementFreeze>()
+            .init_resource::<crate::ui::EscapeMenuState>()
+            .insert_resource(PlayerInputIntent { move_x: 1.0, move_z: -1.0, jump: true })
+            .add_systems(Update, move_cube);
+        app.world_mut().resource_mut::<crate::ui::EscapeMenuState>().is_open = true;
+        app.update();
+        let input = app.world().resource::<PlayerInputIntent>();
+        assert_eq!((input.move_x, input.move_z, input.jump), (0.0, 0.0, false));
+    }
 }

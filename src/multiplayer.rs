@@ -210,7 +210,11 @@ pub struct SinglePlayerConnect {
     pub auth_secret: String,
 }
 
-pub fn setup_network(mut commands: Commands, single_player: Option<Res<SinglePlayerConnect>>) {
+pub fn setup_network(
+    mut commands: Commands,
+    local_player: Res<LocalPlayerId>,
+    single_player: Option<Res<SinglePlayerConnect>>,
+) {
     let role = if single_player.is_some() {
         RuntimeNetRole::UntrustedClient
     } else if env::var("CUBE_AUTH_SERVER")
@@ -271,6 +275,13 @@ pub fn setup_network(mut commands: Commands, single_player: Option<Res<SinglePla
 
     let server_runtime = if role == RuntimeNetRole::AuthServer {
         let auth_secret = env::var("CUBE_AUTH_SECRET").unwrap_or_else(|_| "dev-auth-secret".to_string());
+        let auth_secret = match learning::map_identity::configured_auth_secret(&auth_secret) {
+            Ok(secret) => secret,
+            Err(error) => {
+                eprintln!("[multiplayer] {error}");
+                return;
+            }
+        };
         Some(learning::server::ServerNetworkManager::with_auth(
             SocketAddr::from(([0, 0, 0, 0], SYNC_PORT)),
             learning::server::ServerAuthConfig {
@@ -288,9 +299,16 @@ pub fn setup_network(mut commands: Commands, single_player: Option<Res<SinglePla
             .map(|sp| sp.auth_secret.clone())
             .or_else(|| env::var("CUBE_AUTH_SECRET").ok())
             .unwrap_or_else(|| "dev-auth-secret".to_string());
+        let auth_secret = match learning::map_identity::configured_auth_secret(&auth_secret) {
+            Ok(secret) => secret,
+            Err(error) => {
+                eprintln!("[multiplayer] {error}");
+                return;
+            }
+        };
         let mut manager = learning::client::ClientNetworkManager::with_identity(
             target_addr,
-            generate_local_player_id().value,
+            local_player.value,
             auth_secret,
         );
         let _ = manager.connect();
@@ -389,11 +407,29 @@ pub fn announce_local_presence(
     local_cube_query: Query<&Transform, With<crate::RotatingCube>>,
     hud: Option<Res<crate::ui::HudState>>,
     mut network: Option<ResMut<NetworkSync>>,
+    mut retry: Local<learning::client::HandshakeRetry>,
 ) {
     let Some(network) = network.as_deref_mut() else {
         return;
     };
 
+    if network.role == RuntimeNetRole::UntrustedClient {
+        let authenticated = network.client_manager.as_ref().is_some_and(|manager|
+            manager.auth_state == learning::client::ClientAuthState::Authenticated);
+        match retry.poll(Instant::now(), authenticated) {
+            learning::client::HandshakeAction::SendHello => {
+                send_payload(network, &encode_auth_hello(local_player.value));
+            }
+            learning::client::HandshakeAction::TimedOut => {
+                if let Some(manager) = network.client_manager.as_mut() {
+                    manager.auth_state = learning::client::ClientAuthState::Unauthenticated;
+                }
+                eprintln!("[net] Connection timed out. Check the server address and authentication settings.");
+            }
+            learning::client::HandshakeAction::Wait => {}
+        }
+        return;
+    }
     if network.presence_state == PresenceState::Announced {
         return;
     }
@@ -445,6 +481,7 @@ pub fn send_local_state(
     ergo: Res<crate::config::HumanErgoConfig>,
     input_intent: Option<Res<crate::controls::PlayerInputIntent>>,
     mut network: Option<ResMut<NetworkSync>>,
+    map: Option<Res<crate::doom_wad::WadCollisionWorld>>,
 ) {
     let Some(network) = network.as_deref_mut() else {
         return;
@@ -515,6 +552,7 @@ pub fn send_local_state(
                 &mut network.authoritative_vertical_velocity,
                 &ergo,
                 SEND_INTERVAL.as_secs_f32(),
+                map.as_deref(),
             );
             server_broadcast_snapshot(network);
             network.last_server_broadcast = Instant::now();
@@ -558,17 +596,20 @@ pub fn receive_remote_states(
 
     let now = Instant::now();
 
-    loop {
-        let mut buf = [0u8; 96];
+    for _ in 0..256 {
+        let mut buf = [0u8; crate::auth_codec::MAX_PACKET_BYTES + 1];
         match network.socket.recv_from(&mut buf) {
             Ok((len, from)) => {
+                if len > crate::auth_codec::MAX_PACKET_BYTES {
+                    continue;
+                }
                 let data = &buf[..len];
                 match network.role {
                     RuntimeNetRole::LegacyPeer => {
                         process_incoming_packet(network, local_player.value, data)
                     }
                     RuntimeNetRole::UntrustedClient => {
-                        process_client_packet(network, local_player.value, data);
+                        process_client_packet(network, from, local_player.value, data);
                     }
                     RuntimeNetRole::AuthServer => {
                         process_server_packet(network, from, data, now);
@@ -631,7 +672,16 @@ pub fn sync_remote_cubes(
         PROJECTILE_DEDUP_TTL,
     );
     if let Some(server) = network.server_runtime.as_mut() {
-        server.sweep_expired_sessions(REMOTE_TIMEOUT);
+        // Mirror steam_mp::sweep_expired_auth_sessions: an evicted player
+        // must lose its sim input and velocity entries, or the shared
+        // authoritative sim keeps refreshing its last_seen and its ghost
+        // persists in every snapshot forever. departed_players drives the
+        // visual despawn and remote-state removal in apply_departures.
+        for player_id in server.sweep_expired_sessions(REMOTE_TIMEOUT) {
+            network.authoritative_inputs.remove(&player_id);
+            network.authoritative_vertical_velocity.remove(&player_id);
+            network.departed_players.insert(player_id);
+        }
     }
 
     // The host's own player (see `apply_local_sim_result`) is now present
@@ -769,7 +819,13 @@ fn decode_projectile_packet(
     ))
 }
 
-fn process_client_packet(network: &mut NetworkSync, local_player_id: u64, data: &[u8]) {
+fn process_client_packet(network: &mut NetworkSync, from: SocketAddr, local_player_id: u64, data: &[u8]) {
+    let Some(manager) = network.client_manager.as_ref() else {
+        return;
+    };
+    if !crate::auth_codec::client_packet_allowed(from == network.target_addr, manager.auth_state, data) {
+        return;
+    }
     if let Some(nonce) = decode_auth_challenge(data) {
         if let Some(manager) = network.client_manager.as_mut() {
             let proof = manager.respond_to_challenge(nonce);
@@ -811,15 +867,10 @@ fn process_server_packet(network: &mut NetworkSync, from: SocketAddr, data: &[u8
 
     if let Some(player_id) = decode_auth_hello(data) {
         if let Ok((_session_id, learning::server::ServerEgressPacket::AuthChallenge { nonce })) =
-            server.handle_connection_request(from)
+            server.handle_connection_request(from, player_id)
         {
             let challenge = encode_auth_challenge(nonce);
             let _ = network.socket.send_to(&challenge, from);
-            if let Some(session_id) = server.session_by_addr.get(&from).copied()
-                && let Some(session) = server.sessions.get_mut(&session_id)
-            {
-                session.player_id = Some(player_id);
-            }
         }
         return;
     }
@@ -844,6 +895,24 @@ fn process_server_packet(network: &mut NetworkSync, from: SocketAddr, data: &[u8
                             last_seen: now,
                         });
                 }
+        return;
+    }
+
+    if let Some((PACKET_LEAVE, player_id, _, _)) = decode_state_packet(data) {
+        // Graceful leave. Honor it only from the address of an
+        // authenticated session bound to the claimed player id, then drop
+        // the sim state immediately instead of ghosting until the session
+        // timeout. Mirrors the client-side PACKET_LEAVE handling.
+        if let Some(session_id) = server.session_by_addr.get(&from).copied()
+            && let Some(session) = server.sessions.get(&session_id)
+            && session.is_authenticated()
+            && session.player_id == Some(player_id)
+        {
+            server.close_session(session_id);
+            network.authoritative_inputs.remove(&player_id);
+            network.authoritative_vertical_velocity.remove(&player_id);
+            network.departed_players.insert(player_id);
+        }
         return;
     }
 
@@ -884,18 +953,14 @@ fn server_broadcast_snapshot(network: &mut NetworkSync) {
         return;
     };
 
-    let snapshot = encode_snapshot_packet(
-        network
-            .remote_states
-            .iter()
-            .map(|(player_id, state)| (*player_id, state.transform, state.color))
-            .collect::<Vec<_>>()
-            .as_slice(),
-    );
-
-    for session in server.sessions.values() {
-        if session.is_authenticated() {
-            let _ = network.socket.send_to(&snapshot, session.addr);
+    let states = network.remote_states.iter()
+        .map(|(player_id, state)| (*player_id, state.transform, state.color))
+        .collect::<Vec<_>>();
+    for snapshot in crate::auth_codec::snapshot_packets(SYNC_MAGIC, SYNC_VERSION, &states) {
+        for session in server.sessions.values() {
+            if session.is_authenticated() {
+                let _ = network.socket.send_to(&snapshot, session.addr);
+            }
         }
     }
 }
@@ -948,9 +1013,6 @@ fn decode_input_packet(data: &[u8]) -> Option<(learning::auth::SessionToken, u32
     crate::auth_codec::decode_input_packet(SYNC_MAGIC, SYNC_VERSION, data)
 }
 
-fn encode_snapshot_packet(states: &[(u64, Transform, Color)]) -> Vec<u8> {
-    crate::auth_codec::encode_snapshot_packet(SYNC_MAGIC, SYNC_VERSION, states)
-}
 
 fn decode_snapshot_packet(data: &[u8]) -> Option<Vec<(u64, Transform, Color)>> {
     crate::auth_codec::decode_snapshot_packet(SYNC_MAGIC, SYNC_VERSION, data)
@@ -984,6 +1046,269 @@ mod tests {
             pending_projectiles: Vec::new(),
             seen_projectiles: HashMap::new(),
         }
+    }
+
+    /// Builds an AuthServer-role network with one fully authenticated
+    /// client (hello → proof → one input packet) and live sim state.
+    fn authed_server_network(client_addr: SocketAddr, player_id: u64) -> NetworkSync {
+        let mut network = make_test_network();
+        network.role = RuntimeNetRole::AuthServer;
+        network.server_runtime = Some(learning::server::ServerNetworkManager::with_auth(
+            network.socket.local_addr().unwrap(),
+            learning::server::ServerAuthConfig {
+                auth_secret: "test-only".into(),
+                token_secret: "test-only".into(),
+            },
+        ));
+        process_server_packet(&mut network, client_addr, &encode_auth_hello(player_id), Instant::now());
+        let session_id = network.server_runtime.as_ref().unwrap().session_by_addr[&client_addr];
+        let nonce = network.server_runtime.as_ref().unwrap().sessions[&session_id].auth_nonce;
+        let proof = learning::auth::make_auth_proof("test-only", player_id, nonce);
+        process_server_packet(&mut network, client_addr, &encode_auth_proof(proof), Instant::now());
+        let token = network.server_runtime.as_ref().unwrap().sessions[&session_id]
+            .session_token
+            .expect("token after auth");
+        let input = encode_input_packet(token, 1, &encode_input_payload(0.5, 0.0, false, Color::WHITE));
+        process_server_packet(&mut network, client_addr, &input, Instant::now());
+        assert!(network.authoritative_inputs.contains_key(&player_id));
+        // Simulate a mid-step velocity entry as step_authoritative_sim would leave.
+        network.authoritative_vertical_velocity.insert(player_id, 1.5);
+        network
+    }
+
+    #[test]
+    fn lan_server_sweep_drops_sim_state_for_silent_clients() {
+        let client_addr = SocketAddr::from(([127, 0, 0, 1], 34590));
+        let mut network = authed_server_network(client_addr, 42);
+
+        // Age the session past REMOTE_TIMEOUT.
+        let session_id = network.server_runtime.as_ref().unwrap().session_by_addr[&client_addr];
+        network.server_runtime.as_mut().unwrap().sessions.get_mut(&session_id).unwrap().last_activity =
+            Instant::now() - REMOTE_TIMEOUT - Duration::from_secs(1);
+
+        let mut app = App::new();
+        app.init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .insert_resource(LocalPlayerId { value: 0 })
+            .insert_resource(network)
+            .add_systems(Update, sync_remote_cubes);
+        // First pass runs the sweep and queues the departure; second pass
+        // applies it (remote-state removal + visual despawn).
+        app.update();
+        app.update();
+
+        let network = app.world().resource::<NetworkSync>();
+        assert!(
+            network.server_runtime.as_ref().unwrap().sessions.is_empty(),
+            "silent session must be evicted"
+        );
+        assert!(!network.authoritative_inputs.contains_key(&42), "sim input must be dropped");
+        assert!(!network.authoritative_vertical_velocity.contains_key(&42), "velocity must be dropped");
+        assert!(!network.remote_states.contains_key(&42), "ghost state must be dropped");
+        assert!(network.departed_players.is_empty(), "departure must be applied");
+    }
+
+    #[test]
+    fn lan_server_honors_leave_from_authenticated_session_only() {
+        let client_addr = SocketAddr::from(([127, 0, 0, 1], 34591));
+        let mut network = authed_server_network(client_addr, 42);
+
+        // A leave claiming a foreign id must be ignored.
+        let bogus = encode_state_packet(PACKET_LEAVE, 43, &Transform::default(), Color::WHITE);
+        process_server_packet(&mut network, client_addr, &bogus, Instant::now());
+        assert!(network.authoritative_inputs.contains_key(&42));
+        assert_eq!(network.server_runtime.as_ref().unwrap().sessions.len(), 1);
+
+        // A leave from an unrelated address must be ignored.
+        let outsider = SocketAddr::from(([127, 0, 0, 1], 34592));
+        let spoof = encode_state_packet(PACKET_LEAVE, 42, &Transform::default(), Color::WHITE);
+        process_server_packet(&mut network, outsider, &spoof, Instant::now());
+        assert!(network.authoritative_inputs.contains_key(&42));
+
+        // The real leave closes the session and drops the sim state.
+        let leave = encode_state_packet(PACKET_LEAVE, 42, &Transform::default(), Color::WHITE);
+        process_server_packet(&mut network, client_addr, &leave, Instant::now());
+        assert!(!network.authoritative_inputs.contains_key(&42));
+        assert!(!network.authoritative_vertical_velocity.contains_key(&42));
+        assert!(network.departed_players.contains(&42));
+        assert!(network.server_runtime.as_ref().unwrap().sessions.is_empty());
+    }
+
+    #[test]
+    fn lan_receives_multi_packet_snapshots_without_truncation() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut network = make_test_network();
+        network.role = RuntimeNetRole::UntrustedClient;
+        network.target_addr = server.local_addr().unwrap();
+        let client_addr = network.socket.local_addr().unwrap();
+        let mut manager = learning::client::ClientNetworkManager::with_identity(network.target_addr, 0, "test-only".into());
+        manager.mark_authenticated(1);
+        network.client_manager = Some(manager);
+        let count = crate::auth_codec::MAX_SNAPSHOT_STATES + 2;
+        let states: Vec<_> = (0..count).map(|id| (id as u64, Transform::default(), Color::WHITE)).collect();
+        let packets = crate::auth_codec::snapshot_packets(SYNC_MAGIC, SYNC_VERSION, &states);
+        assert_eq!(packets.len(), 2);
+        for packet in packets {
+            assert!(packet.len() <= crate::auth_codec::MAX_PACKET_BYTES);
+            server.send_to(&packet, client_addr).unwrap();
+        }
+        let mut app = App::new();
+        app.insert_resource(LocalPlayerId { value: 0 })
+            .insert_resource(network)
+            .add_systems(Update, receive_remote_states);
+        app.update();
+        let network = app.world().resource::<NetworkSync>();
+        assert_eq!(network.remote_states.len(), count - 1);
+        assert!(network.pending_local_reconciliation.is_some());
+    }
+
+    #[test]
+    fn lan_rejects_untrusted_and_unauthenticated_snapshots() {
+        let mut network = make_test_network();
+        network.role = RuntimeNetRole::UntrustedClient;
+        let host = network.target_addr;
+        let outsider = SocketAddr::from(([127, 0, 0, 1], 34568));
+        let mut manager = learning::client::ClientNetworkManager::with_identity(host, 42, "test-only".into());
+        manager.connect().unwrap();
+        network.client_manager = Some(manager);
+        let packet = crate::auth_codec::encode_snapshot_packet(
+            SYNC_MAGIC, SYNC_VERSION, &[(42, Transform::from_xyz(50.0, 0.0, 0.0), Color::WHITE)],
+        );
+        process_client_packet(&mut network, host, 42, &packet);
+        assert!(network.pending_local_reconciliation.is_none());
+        process_client_packet(&mut network, outsider, 42, &encode_auth_challenge(123));
+        assert_eq!(network.client_manager.as_ref().unwrap().auth_state,
+            learning::client::ClientAuthState::AwaitingChallenge);
+        process_client_packet(&mut network, host, 42, &encode_auth_accept(123));
+        assert!(network.client_manager.as_ref().unwrap().session_token.is_none());
+        network.client_manager.as_mut().unwrap().mark_authenticated(123);
+        process_client_packet(&mut network, outsider, 42, &packet);
+        assert!(network.pending_local_reconciliation.is_none());
+        process_client_packet(&mut network, host, 42, &packet);
+        assert_eq!(network.pending_local_reconciliation.unwrap().translation.x, 50.0);
+    }
+
+    #[test]
+    fn lan_handshake_preserves_local_identity() {
+        handshake_roundtrip(false);
+    }
+
+    #[test]
+    fn lan_map_identity_rejects_different_content_and_map_name() {
+        use learning::map_identity::MapIdentity;
+        for (bytes, name, accepted) in [
+            (&b"fixture-a"[..], "MAP01", true),
+            (&b"fixture-b"[..], "MAP01", false),
+            (&b"fixture-a"[..], "MAP02", false),
+        ] {
+            let mut server = make_test_network();
+            let mut client = make_test_network();
+            server.role = RuntimeNetRole::AuthServer;
+            client.role = RuntimeNetRole::UntrustedClient;
+            let host = server.socket.local_addr().unwrap();
+            let peer = client.socket.local_addr().unwrap();
+            client.target_addr = host;
+            for socket in [&server.socket, &client.socket] {
+                socket.set_nonblocking(false).unwrap();
+                socket.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+            }
+            let identity = MapIdentity::from_reader(&b"fixture-a"[..], "MAP01").unwrap();
+            let secret = learning::auth::bind_map_secret("test-only", &identity.0);
+            server.server_runtime = Some(learning::server::ServerNetworkManager::with_auth(
+                host, learning::server::ServerAuthConfig { auth_secret: secret.clone(), token_secret: secret },
+            ));
+            let identity = MapIdentity::from_reader(bytes, name).unwrap();
+            let secret = learning::auth::bind_map_secret("test-only", &identity.0);
+            let mut manager = learning::client::ClientNetworkManager::with_identity(host, 42, secret);
+            manager.connect().unwrap();
+            client.client_manager = Some(manager);
+            client.socket.send_to(&encode_auth_hello(42), host).unwrap();
+            let mut buffer = [0u8; 256];
+            let (length, source) = server.socket.recv_from(&mut buffer).unwrap();
+            assert_eq!(source, peer);
+            process_server_packet(&mut server, source, &buffer[..length], Instant::now());
+            let (length, source) = client.socket.recv_from(&mut buffer).unwrap();
+            process_client_packet(&mut client, source, 42, &buffer[..length]);
+            let (length, source) = server.socket.recv_from(&mut buffer).unwrap();
+            process_server_packet(&mut server, source, &buffer[..length], Instant::now());
+            assert_eq!(server.remote_states.contains_key(&42), accepted);
+            if accepted {
+                let (length, source) = client.socket.recv_from(&mut buffer).unwrap();
+                process_client_packet(&mut client, source, 42, &buffer[..length]);
+                assert_eq!(client.client_manager.as_ref().unwrap().auth_state, learning::client::ClientAuthState::Authenticated);
+            } else {
+                let error = client.socket.recv_from(&mut buffer).unwrap_err();
+                assert!(matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut));
+                assert_ne!(client.client_manager.as_ref().unwrap().auth_state, learning::client::ClientAuthState::Authenticated);
+            }
+        }
+    }
+
+    #[test]
+    fn lan_handshake_recovers_lost_hello_and_accept() {
+        handshake_roundtrip(true);
+    }
+
+    fn handshake_roundtrip(drop_packets: bool) {
+        let mut server = make_test_network();
+        server.role = RuntimeNetRole::AuthServer;
+        server.socket.set_nonblocking(false).unwrap();
+        server.socket.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let address = server.socket.local_addr().unwrap();
+        server.server_runtime = Some(learning::server::ServerNetworkManager::with_auth(
+            address,
+            learning::server::ServerAuthConfig {
+                auth_secret: "test-only".into(),
+                token_secret: "test-token-only".into(),
+            },
+        ));
+        let mut app = App::new();
+        app.insert_resource(LocalPlayerId { value: 42 })
+            .insert_resource(SinglePlayerConnect {
+                target_addr: address,
+                auth_secret: "test-only".into(),
+            })
+            .add_systems(Startup, setup_network)
+            .add_systems(Update, (announce_local_presence, receive_remote_states).chain());
+        app.update();
+        let mut bytes = [0; 256];
+        if drop_packets {
+            let (length, _) = server.socket.recv_from(&mut bytes).unwrap();
+            assert_eq!(decode_auth_hello(&bytes[..length]), Some(42));
+            std::thread::sleep(Duration::from_millis(510));
+            app.update();
+        }
+        let (length, from) = server.socket.recv_from(&mut bytes).unwrap();
+        assert_eq!(decode_auth_hello(&bytes[..length]), Some(42));
+        process_server_packet(&mut server, from, &bytes[..length], Instant::now());
+        app.update();
+        let (length, from) = server.socket.recv_from(&mut bytes).unwrap();
+        assert_eq!(decode_auth_proof(&bytes[..length]).unwrap().player_id, 42);
+        process_server_packet(&mut server, from, &bytes[..length], Instant::now());
+        if drop_packets {
+            let (length, _) = app.world().resource::<NetworkSync>().socket.recv_from(&mut bytes).unwrap();
+            assert!(decode_auth_accept(&bytes[..length]).is_some());
+            std::thread::sleep(Duration::from_millis(510));
+            app.update();
+            let (length, from) = server.socket.recv_from(&mut bytes).unwrap();
+            assert_eq!(decode_auth_hello(&bytes[..length]), Some(42));
+            process_server_packet(&mut server, from, &bytes[..length], Instant::now());
+            app.update();
+            let (length, from) = server.socket.recv_from(&mut bytes).unwrap();
+            assert!(decode_auth_proof(&bytes[..length]).is_some());
+            process_server_packet(&mut server, from, &bytes[..length], Instant::now());
+        }
+        app.update();
+        let network = app.world().resource::<NetworkSync>();
+        let manager = network.client_manager.as_ref().unwrap();
+        assert_eq!(manager.player_id, 42);
+        assert_eq!(manager.auth_state, learning::client::ClientAuthState::Authenticated);
+        assert!(server.remote_states.contains_key(&42));
+        server_broadcast_snapshot(&mut server);
+        app.update();
+        let network = app.world().resource::<NetworkSync>();
+        assert!(network.pending_local_reconciliation.is_some());
+        assert!(!network.remote_states.contains_key(&42));
     }
 
     #[test]

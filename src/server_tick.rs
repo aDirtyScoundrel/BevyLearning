@@ -22,12 +22,18 @@ pub fn step_authoritative_sim(
     vertical_velocity: &mut HashMap<u64, f32>,
     ergo: &crate::config::HumanErgoConfig,
     dt: f32,
+    map: Option<&crate::doom_wad::WadCollisionWorld>,
 ) {
-    if dt <= f32::EPSILON {
+    if !dt.is_finite() || dt <= f32::EPSILON {
         return;
     }
 
-    for (player_id, input) in authoritative_inputs {
+    let mut players: Vec<u64> = authoritative_inputs.keys().copied().collect();
+    players.sort_unstable();
+    for player_id in &players {
+        let input = &authoritative_inputs[player_id];
+        let new_player = !vertical_velocity.contains_key(player_id);
+        let spawn_slot = vertical_velocity.len();
         let vy = vertical_velocity.entry(*player_id).or_insert(0.0);
         let state = remote_states.entry(*player_id).or_insert(crate::multiplayer::RemoteState {
             transform: Transform::from_xyz(0.0, crate::player::CUBE_REST_Y, 0.0),
@@ -35,20 +41,22 @@ pub fn step_authoritative_sim(
             last_seen: Instant::now(),
         });
 
+        if new_player && let Some(spawn) = map.and_then(|map| map.spawn_for_slot(spawn_slot)) {
+            state.transform = spawn;
+        }
+        let body_height = crate::player::CUBE_REST_Y * ergo.movement.player_scale.clamp(0.35, 3.0);
+        let rest_y = body_height + map.map_or(0.0, |map| map.floor_height_at(state.transform.translation));
+        let previous = state.transform.translation;
         state.transform.translation.x += input.move_x.clamp(-1.0, 1.0) * ergo.movement.move_speed * dt;
         state.transform.translation.z += input.move_z.clamp(-1.0, 1.0) * ergo.movement.move_speed * dt;
 
-        if input.jump && state.transform.translation.y <= crate::player::CUBE_REST_Y + 0.001 {
+        if input.jump && state.transform.translation.y <= rest_y + 0.001 {
             *vy = ergo.movement.jump_velocity;
         }
 
         *vy -= ergo.movement.gravity * dt;
         state.transform.translation.y += *vy * dt;
 
-        if state.transform.translation.y <= crate::player::CUBE_REST_Y {
-            state.transform.translation.y = crate::player::CUBE_REST_Y;
-            *vy = 0.0;
-        }
 
         state.transform.translation.x = state
             .transform
@@ -60,6 +68,14 @@ pub fn step_authoritative_sim(
             .translation
             .z
             .clamp(-ergo.movement.plane_limit, ergo.movement.plane_limit);
+        if let Some(map) = map {
+            state.transform.translation = map.resolve_motion(previous, state.transform.translation);
+        }
+        let rest_y = body_height + map.map_or(0.0, |map| map.floor_height_at(state.transform.translation));
+        if state.transform.translation.y <= rest_y {
+            state.transform.translation.y = rest_y;
+            *vy = 0.0;
+        }
         state.color = input.color;
         state.last_seen = Instant::now();
     }
@@ -69,6 +85,60 @@ pub fn step_authoritative_sim(
 mod tests {
     use super::*;
     use crate::multiplayer::{PlayerInputSample, RemoteState};
+
+    #[test]
+    fn map_starts_and_raised_floor_drive_the_server_state() {
+        use crate::doom_wad::{WadCollisionWorld, WadSectorRegion, WallCollisionSegment};
+        let points = [Vec2::new(-5.0,-5.0), Vec2::new(5.0,-5.0), Vec2::new(5.0,5.0), Vec2::new(-5.0,5.0)];
+        let edges = (0..4).map(|i| WallCollisionSegment { start: points[i], end: points[(i+1)%4] }).collect();
+        let rest = 3.0 + crate::player::CUBE_REST_Y;
+        let map = WadCollisionWorld {
+            sectors: vec![WadSectorRegion { edges, floor: 3.0, ceiling: 8.0 }],
+            player_spawns: vec![Transform::from_xyz(-2.0,rest,0.0), Transform::from_xyz(2.0,rest,0.0)],
+            ..Default::default()
+        };
+        let mut states = HashMap::new();
+        let mut velocities = HashMap::new();
+        let mut inputs = HashMap::from([(9, input(0.0,0.0,false)), (2, input(0.0,0.0,false))]);
+        let e = ergo();
+        step_authoritative_sim(&mut states, &inputs, &mut velocities, &e, 0.01, Some(&map));
+        assert_eq!(states[&2].transform.translation, Vec3::new(-2.0,rest,0.0));
+        assert_eq!(states[&9].transform.translation, Vec3::new(2.0,rest,0.0));
+        inputs.get_mut(&2).unwrap().jump = true;
+        step_authoritative_sim(&mut states, &inputs, &mut velocities, &e, 0.01, Some(&map));
+        assert!(states[&2].transform.translation.y > rest);
+        inputs.get_mut(&2).unwrap().jump = false;
+        for _ in 0..1000 {
+            step_authoritative_sim(&mut states, &inputs, &mut velocities, &e, 0.01, Some(&map));
+        }
+        assert!((states[&2].transform.translation.y - rest).abs() < 0.001);
+        assert_eq!(velocities[&2], 0.0);
+        assert_eq!(map.spawn_for_slot(2), map.spawn_for_slot(0));
+    }
+
+    #[test]
+    fn map_collision_stops_a_server_step_that_crosses_a_wall() {
+        let map = crate::doom_wad::WadCollisionWorld {
+            segments: vec![crate::doom_wad::WallCollisionSegment {
+                start: Vec2::new(0.0, -10.0), end: Vec2::new(0.0, 10.0),
+            }],
+            push_radius: 0.26,
+            ..Default::default()
+        };
+        let mut e = ergo();
+        e.movement.move_speed = 40.0;
+        for collision in [None, Some(&map)] {
+            let mut states = HashMap::from([(1, RemoteState {
+                transform: Transform::from_xyz(-2.0, crate::player::CUBE_REST_Y, 0.0),
+                color: Color::WHITE, last_seen: Instant::now(),
+            })]);
+            let inputs = HashMap::from([(1, input(1.0, 0.0, false))]);
+            step_authoritative_sim(&mut states, &inputs, &mut HashMap::new(), &e, 0.1, collision);
+            let x = states[&1].transform.translation.x;
+            if collision.is_some() { assert!(x <= -map.push_radius); }
+            else { assert!((x - 2.0).abs() < 0.001); }
+        }
+    }
 
     fn ergo() -> crate::config::HumanErgoConfig {
         crate::config::HumanErgoConfig::default()
@@ -92,7 +162,7 @@ mod tests {
         let mut inputs = HashMap::new();
         inputs.insert(1u64, input(1.0, 1.0, false));
 
-        step_authoritative_sim(&mut states, &inputs, &mut vy, &ergo(), 0.0);
+        step_authoritative_sim(&mut states, &inputs, &mut vy, &ergo(), 0.0, None);
         assert!(states.is_empty(), "zero dt must not spawn or move anything");
     }
 
@@ -105,7 +175,7 @@ mod tests {
         inputs.insert(1u64, input(1000.0, 0.0, false));
 
         let e = ergo();
-        step_authoritative_sim(&mut states, &inputs, &mut vy, &e, 1.0);
+        step_authoritative_sim(&mut states, &inputs, &mut vy, &e, 1.0, None);
 
         let x = states[&1].transform.translation.x;
         assert!(
@@ -124,7 +194,7 @@ mod tests {
         let e = ergo();
         // Many long steps: without clamping this would run off the plane.
         for _ in 0..500 {
-            step_authoritative_sim(&mut states, &inputs, &mut vy, &e, 0.1);
+            step_authoritative_sim(&mut states, &inputs, &mut vy, &e, 0.1, None);
         }
 
         let t = states[&1].transform.translation;
@@ -141,7 +211,7 @@ mod tests {
         // One frame holding jump...
         let mut inputs = HashMap::new();
         inputs.insert(1u64, input(0.0, 0.0, true));
-        step_authoritative_sim(&mut states, &inputs, &mut vy, &e, 0.016);
+        step_authoritative_sim(&mut states, &inputs, &mut vy, &e, 0.016, None);
         assert!(vy[&1] != 0.0, "jump should impart vertical velocity");
 
         // ...then release. Holding jump would re-trigger on every ground
@@ -150,7 +220,7 @@ mod tests {
         // the landing.
         inputs.insert(1u64, input(0.0, 0.0, false));
         for _ in 0..1000 {
-            step_authoritative_sim(&mut states, &inputs, &mut vy, &e, 0.016);
+            step_authoritative_sim(&mut states, &inputs, &mut vy, &e, 0.016, None);
         }
 
         let y = states[&1].transform.translation.y;
@@ -176,8 +246,8 @@ mod tests {
         let mut steam_vy = HashMap::new();
 
         for _ in 0..120 {
-            step_authoritative_sim(&mut lan_states, &inputs, &mut lan_vy, &e, 0.016);
-            step_authoritative_sim(&mut steam_states, &inputs, &mut steam_vy, &e, 0.016);
+            step_authoritative_sim(&mut lan_states, &inputs, &mut lan_vy, &e, 0.016, None);
+            step_authoritative_sim(&mut steam_states, &inputs, &mut steam_vy, &e, 0.016, None);
         }
 
         let a = lan_states[&7].transform.translation;

@@ -15,6 +15,79 @@ pub const PACKET_AUTH_ACCEPT: u8 = 13;
 // Ongoing game traffic once a session is established
 pub const PACKET_INPUT: u8 = 14;     // client → host: movement axes + color
 pub const PACKET_SNAPSHOT: u8 = 15; // host → clients: authoritative state for all players
+pub const MAX_PACKET_BYTES: usize = 1200;
+pub const MAX_SNAPSHOT_STATES: usize = (MAX_PACKET_BYTES - 10) / 24;
+
+pub fn snapshot_packets(magic: [u8; 4], version: u8, states: &[(u64, Transform, Color)]) -> Vec<Vec<u8>> {
+    states.chunks(MAX_SNAPSHOT_STATES)
+        .map(|chunk| encode_snapshot_packet(magic, version, chunk))
+        .collect()
+}
+
+/// Reject unexpected senders and packets outside the current handshake stage.
+pub fn client_packet_allowed(
+    trusted_sender: bool,
+    state: learning::client::ClientAuthState,
+    data: &[u8],
+) -> bool {
+    use learning::client::ClientAuthState;
+    if !trusted_sender {
+        return false;
+    }
+    match data.get(5).copied() {
+        Some(PACKET_AUTH_CHALLENGE) => matches!(
+            state,
+            ClientAuthState::AwaitingChallenge | ClientAuthState::AwaitingAcceptance
+        ),
+        Some(PACKET_AUTH_ACCEPT) => state == ClientAuthState::AwaitingAcceptance,
+        Some(PACKET_SNAPSHOT) => state == ClientAuthState::Authenticated,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod client_packet_policy_tests {
+    #[test]
+    fn reject_non_finite_movement_on_both_axes() {
+        use super::*;
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(decode_input_payload(&encode_input_payload(bad, 0.0, false, Color::WHITE)).is_none());
+            assert!(decode_input_payload(&encode_input_payload(0.0, bad, false, Color::WHITE)).is_none());
+        }
+        let result = decode_input_payload(&encode_input_payload(4.0, -4.0, true, Color::WHITE)).unwrap();
+        assert_eq!((result.0, result.1, result.2), (1.0, -1.0, true));
+    }
+
+    use super::*;
+    use learning::client::ClientAuthState::*;
+
+    #[test]
+    fn reject_untrusted_sender_in_every_stage() {
+        for state in [Unauthenticated, AwaitingChallenge, AwaitingAcceptance, Authenticated] {
+            for kind in [PACKET_AUTH_CHALLENGE, PACKET_AUTH_ACCEPT, PACKET_SNAPSHOT] {
+                assert!(!client_packet_allowed(false, state, &[0, 0, 0, 0, 1, kind]));
+            }
+        }
+    }
+
+    #[test]
+    fn enforce_handshake_packet_order() {
+        let challenge = [0, 0, 0, 0, 1, PACKET_AUTH_CHALLENGE];
+        let accept = [0, 0, 0, 0, 1, PACKET_AUTH_ACCEPT];
+        let snapshot = [0, 0, 0, 0, 1, PACKET_SNAPSHOT];
+        assert!(client_packet_allowed(true, AwaitingChallenge, &challenge));
+        assert!(client_packet_allowed(true, AwaitingAcceptance, &challenge));
+        assert!(client_packet_allowed(true, AwaitingAcceptance, &accept));
+        assert!(client_packet_allowed(true, Authenticated, &snapshot));
+        for state in [Unauthenticated, AwaitingChallenge, AwaitingAcceptance] {
+            assert!(!client_packet_allowed(true, state, &snapshot));
+        }
+        assert!(!client_packet_allowed(true, AwaitingChallenge, &accept));
+        assert!(!client_packet_allowed(true, Authenticated, &accept));
+        assert!(!client_packet_allowed(true, Authenticated, &challenge));
+        assert!(!client_packet_allowed(true, Authenticated, &[]));
+    }
+}
 
 pub fn encode_auth_hello(magic: [u8; 4], version: u8, player_id: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(14);
@@ -101,13 +174,17 @@ pub fn encode_input_payload(move_x: f32, move_z: f32, jump: bool, color: Color) 
 }
 
 pub fn decode_input_payload(payload: &[u8]) -> Option<(f32, f32, bool, Color)> {
-    if payload.len() < 12 {
+    if payload.len() != 12 {
         return None;
     }
-
+    let move_x = f32::from_le_bytes(payload.get(0..4)?.try_into().ok()?);
+    let move_z = f32::from_le_bytes(payload.get(4..8)?.try_into().ok()?);
+    if !move_x.is_finite() || !move_z.is_finite() {
+        return None;
+    }
     Some((
-        f32::from_le_bytes(payload[0..4].try_into().ok()?),
-        f32::from_le_bytes(payload[4..8].try_into().ok()?),
+        move_x.clamp(-1.0, 1.0),
+        move_z.clamp(-1.0, 1.0),
         payload[8] != 0,
         Color::srgb(
             payload[9] as f32 / 255.0,
@@ -179,7 +256,7 @@ pub fn encode_snapshot_packet(magic: [u8; 4], version: u8, states: &[(u64, Trans
 }
 
 pub fn decode_snapshot_packet(magic: [u8; 4], version: u8, data: &[u8]) -> Option<Vec<(u64, Transform, Color)>> {
-    if data.len() < 10 || data[0..4] != magic || data[4] != version || data[5] != PACKET_SNAPSHOT {
+    if data.len() < 10 || data.len() > MAX_PACKET_BYTES || data[0..4] != magic || data[4] != version || data[5] != PACKET_SNAPSHOT {
         return None;
     }
 
@@ -189,7 +266,7 @@ pub fn decode_snapshot_packet(magic: [u8; 4], version: u8, data: &[u8]) -> Optio
     // contain — a raw wire-controlled `count` near u32::MAX would otherwise
     // trigger a multi-GB allocation attempt before any bounds are checked.
     let max_possible_records = data.len().saturating_sub(10) / RECORD_SIZE;
-    if count > max_possible_records {
+    if count > max_possible_records || data.len() != 10 + count * RECORD_SIZE {
         return None;
     }
     let mut idx = 10;
@@ -207,6 +284,12 @@ pub fn decode_snapshot_packet(magic: [u8; 4], version: u8, data: &[u8]) -> Optio
         idx += 4;
         let z = f32::from_le_bytes(data[idx..idx + 4].try_into().ok()?);
         idx += 4;
+        // One non-finite coordinate would NaN-poison local reconciliation
+        // permanently (lerp/distance never settle). Reject the whole packet,
+        // matching sync_codec::read_finite_f32 and decode_input_payload.
+        if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+            return None;
+        }
         let r = data[idx] as f32 / 255.0;
         let g = data[idx + 1] as f32 / 255.0;
         let b = data[idx + 2] as f32 / 255.0;
@@ -287,6 +370,32 @@ mod tests {
         assert_eq!(decoded[1].0, 2);
         assert!((decoded[0].1.translation.x - 1.0).abs() < 0.0001);
         assert!((decoded[1].1.translation.z - 4.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn snapshot_decode_rejects_nonfinite_coordinates() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for states in [
+                vec![(1, Transform::from_xyz(bad, 0.0, 0.0), Color::WHITE)],
+                vec![(1, Transform::from_xyz(0.0, bad, 0.0), Color::WHITE)],
+                vec![(1, Transform::from_xyz(0.0, 0.0, bad), Color::WHITE)],
+                // One bad record must sink the whole packet.
+                vec![
+                    (1, Transform::from_xyz(1.0, 2.0, 3.0), Color::WHITE),
+                    (2, Transform::from_xyz(bad, 0.0, 0.0), Color::WHITE),
+                ],
+            ] {
+                let encoded = encode_snapshot_packet(TEST_MAGIC, TEST_VERSION, &states);
+                assert_eq!(decode_snapshot_packet(TEST_MAGIC, TEST_VERSION, &encoded), None);
+            }
+        }
+        // Control: finite coordinates still decode.
+        let ok = vec![(1, Transform::from_xyz(1.0, 2.0, 3.0), Color::WHITE)];
+        let encoded = encode_snapshot_packet(TEST_MAGIC, TEST_VERSION, &ok);
+        assert_eq!(
+            decode_snapshot_packet(TEST_MAGIC, TEST_VERSION, &encoded).unwrap().len(),
+            1
+        );
     }
 
     #[test]

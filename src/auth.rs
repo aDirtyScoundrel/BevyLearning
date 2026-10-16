@@ -13,6 +13,31 @@ type HmacSha256 = Hmac<Sha256>;
 
 pub type SessionToken = u128;
 
+/// Bind an authentication secret to one map without transmitting the secret.
+pub fn bind_map_secret(secret: &str, identity: &[u8; 32]) -> String {
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .expect("HMAC accepts keys of any length");
+    mac.update(b"chicken-gun/map-auth/v1\0");
+    mac.update(identity);
+    let digest = mac.finalize().into_bytes();
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod map_auth_tests {
+    use super::*;
+
+    #[test]
+    fn map_bound_proof_requires_matching_map_and_secret() {
+        let key = bind_map_secret("test-only", &[1; 32]);
+        let proof = make_auth_proof(&key, 42, 1234);
+        assert!(verify_auth_proof(&bind_map_secret("test-only", &[1; 32]), proof));
+        assert!(!verify_auth_proof(&bind_map_secret("test-only", &[2; 32]), proof));
+        assert!(!verify_auth_proof(&bind_map_secret("different", &[1; 32]), proof));
+        assert!(!verify_auth_proof("test-only", proof));
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthProof {
     pub player_id: u64,

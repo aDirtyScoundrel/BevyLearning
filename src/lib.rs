@@ -13,6 +13,8 @@ pub mod connection;
 pub mod packet;
 pub mod client;
 pub mod server;
+pub mod marathon;
+pub mod map_identity;
 
 pub use bitstream::{BitStreamReader, BitStreamWriter};
 pub use huffman::HuffmanCodec;
