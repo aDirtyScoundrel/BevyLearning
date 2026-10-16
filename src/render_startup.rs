@@ -28,6 +28,8 @@ impl Plugin for StartupSurfacePlugin {
     }
 }
 
+// Bevy system: the argument list IS the dependency injection.
+#[allow(clippy::too_many_arguments)]
 fn clear_pending_surface(
     windows: Res<ExtractedWindows>,
     cameras: Query<(&ViewTarget, &ExtractedCamera)>,
